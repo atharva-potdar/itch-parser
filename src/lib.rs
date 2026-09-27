@@ -30,6 +30,7 @@ fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMu
 }
 
 enum PacketStatus {
+    NewSession { previous: Option<[u8; 10]> },
     InOrder,
     Gap {start: u64, count: u64},
     StaleOrDuplicate,
@@ -37,13 +38,22 @@ enum PacketStatus {
 }
 
 struct Session {
+    session_id: Option<[u8; 10]>,
     expected_sequence_number: u64,
 }
 
 impl Session {
-    fn new(start: u64) -> Self { Self { expected_sequence_number: start } }
+    fn new() -> Self {
+        Self { session_id: None, expected_sequence_number: 0 }
+    }
 
     fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
+        if self.session_id != Some(packet_header.session) {
+            let previous = self.session_id.replace(packet_header.session);
+            self.expected_sequence_number = packet_header.sequence_number
+                + packet_header.message_count as u64;
+            return PacketStatus::NewSession { previous };
+        }
         let sequence_number = packet_header.sequence_number;
         let end = sequence_number + packet_header.message_count as u64;
         if packet_header.message_count == 0xFFFF {
