@@ -44,8 +44,8 @@ pub enum PacketStatus {
 }
 
 pub struct Session {
-    pub session_id: Option<[u8; 10]>,
-    pub expected_sequence_number: u64,
+    session_id: Option<[u8; 10]>,
+    expected_sequence_number: u64,
 }
 
 impl Default for Session {
@@ -61,6 +61,16 @@ impl Session {
             session_id: None,
             expected_sequence_number: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn expected_sequence_number(&self) -> u64 {
+        self.expected_sequence_number
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> Option<[u8; 10]> {
+        self.session_id
     }
 
     pub fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
