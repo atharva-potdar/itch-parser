@@ -28,3 +28,32 @@ fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMu
         buf = rest;
     }
 }
+
+enum PacketStatus {
+    InOrder,
+    Gap(u64),
+    StaleOrDuplicate,
+}
+
+struct Session {
+    expected_sequence_number: u64,
+}
+
+impl Session {
+    fn new(start: u64) -> Self { Self { expected_sequence_number: start } }
+
+    fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
+        let sequence_number = packet_header.sequence_number;
+        let end = sequence_number + packet_header.message_count as u64;
+        if sequence_number == self.expected_sequence_number {
+            self.expected_sequence_number = end;
+            PacketStatus::InOrder
+        } else if sequence_number > self.expected_sequence_number {
+            let gap = sequence_number - self.expected_sequence_number;
+            self.expected_sequence_number = end;
+            PacketStatus::Gap(gap)
+        } else {
+            PacketStatus::StaleOrDuplicate
+        }
+    }
+}
