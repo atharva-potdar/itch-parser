@@ -31,8 +31,9 @@ fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMu
 
 enum PacketStatus {
     InOrder,
-    Gap(u64),
+    Gap {start: u64, count: u64},
     StaleOrDuplicate,
+    EndOfSession,
 }
 
 struct Session {
@@ -45,14 +46,21 @@ impl Session {
     fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
         let sequence_number = packet_header.sequence_number;
         let end = sequence_number + packet_header.message_count as u64;
-        if sequence_number == self.expected_sequence_number {
+        if packet_header.message_count == 0xFFFF {
+            PacketStatus::EndOfSession
+        } else if sequence_number == self.expected_sequence_number {
             self.expected_sequence_number = end;
             PacketStatus::InOrder
         } else if sequence_number > self.expected_sequence_number {
+            let old_expected_sequence_number = self.expected_sequence_number;
             let gap = sequence_number - self.expected_sequence_number;
             self.expected_sequence_number = end;
-            PacketStatus::Gap(gap)
+            PacketStatus::Gap {
+                start: old_expected_sequence_number,
+                count: gap
+            }
         } else {
+            // if end > self.expected_sequence_number, partial overlap
             PacketStatus::StaleOrDuplicate
         }
     }
