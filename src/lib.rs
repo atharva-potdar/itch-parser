@@ -16,3 +16,15 @@ fn parse_header(body: &[u8]) -> Option<(MoldUDP64PacketHeader, &[u8])> {
         message_body
     ))
 }
+
+
+fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMut(&[u8])) {
+    let mut buf = message_body;
+    for _ in 0..message_count {
+        let Some((message_length_bytes, rest)) = buf.split_at_checked(2) else { return };
+        let message_length = u16::from_be_bytes(message_length_bytes.try_into().unwrap()) as usize;
+        let Some((message_data, rest)) = rest.split_at_checked(message_length) else { return };
+        handle(message_data);
+        buf = rest;
+    }
+}
