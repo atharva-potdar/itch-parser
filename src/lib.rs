@@ -50,17 +50,22 @@ impl Session {
     }
 
     fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
+        let sequence_number = packet_header.sequence_number;
+        let is_end_of_session = packet_header.message_count == 0xFFFF;
+        let advance_by = if is_end_of_session {0} else {packet_header.message_count as u64};
+        let end = sequence_number + advance_by;
+
         if self.session_id != Some(packet_header.session) {
             let previous = self.session_id.replace(packet_header.session);
-            self.expected_sequence_number = packet_header.sequence_number
-                + packet_header.message_count as u64;
+            self.expected_sequence_number = end;
             return PacketStatus::NewSession { previous };
         }
-        let sequence_number = packet_header.sequence_number;
-        let end = sequence_number + packet_header.message_count as u64;
-        if packet_header.message_count == 0xFFFF {
-            PacketStatus::EndOfSession
-        } else if sequence_number == self.expected_sequence_number {
+
+        if is_end_of_session {
+            return PacketStatus::EndOfSession;
+        }
+
+        if sequence_number == self.expected_sequence_number {
             self.expected_sequence_number = end;
             PacketStatus::InOrder
         } else if sequence_number > self.expected_sequence_number {
