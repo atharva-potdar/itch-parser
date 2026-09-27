@@ -60,7 +60,9 @@ impl Session {
                 count: gap
             }
         } else {
-            // if end > self.expected_sequence_number, partial overlap
+            // Assume that retransmission requests cover exactly the requested
+            // range, so that even if there is partial overlap, it counts as
+            // fully stale
             PacketStatus::StaleOrDuplicate
         }
     }
