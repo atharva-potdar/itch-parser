@@ -1,58 +1,76 @@
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct MoldUDP64PacketHeader {
-    session: [u8; 10],
-    sequence_number: u64,
-    message_count: u16
+pub struct MoldUDP64PacketHeader {
+    pub session: [u8; 10],
+    pub sequence_number: u64,
+    pub message_count: u16,
 }
 
-
-fn parse_header(body: &[u8]) -> Option<(MoldUDP64PacketHeader, &[u8])> {
+#[must_use]
+pub fn parse_header(body: &[u8]) -> Option<(MoldUDP64PacketHeader, &[u8])> {
     let (message_header, message_body) = body.split_at_checked(20)?;
     Some((
         MoldUDP64PacketHeader {
             session: message_header[..10].try_into().ok()?,
             sequence_number: u64::from_be_bytes(message_header[10..18].try_into().ok()?),
-            message_count: u16::from_be_bytes(message_header[18..20].try_into().ok()?)
+            message_count: u16::from_be_bytes(message_header[18..20].try_into().ok()?),
         },
-        message_body
+        message_body,
     ))
 }
 
-
-fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMut(&[u8])) {
+pub fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMut(&[u8])) {
     let mut buf = message_body;
     for _ in 0..message_count {
-        let Some((message_length_bytes, rest)) = buf.split_at_checked(2) else { return };
-        let message_length = u16::from_be_bytes(message_length_bytes.try_into().unwrap()) as usize;
-        let Some((message_data, rest)) = rest.split_at_checked(message_length) else { return };
+        let Some((message_length_bytes, rest)) = buf.split_at_checked(2) else {
+            return;
+        };
+        let message_length =
+            u16::from_be_bytes([message_length_bytes[0], message_length_bytes[1]]) as usize;
+        let Some((message_data, rest)) = rest.split_at_checked(message_length) else {
+            return;
+        };
         handle(message_data);
         buf = rest;
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum PacketStatus {
+#[derive(Debug, PartialEq, Eq)]
+pub enum PacketStatus {
     NewSession { previous: Option<[u8; 10]> },
     InOrder,
-    Gap {start: u64, count: u64},
+    Gap { start: u64, count: u64 },
     StaleOrDuplicate,
     EndOfSession,
 }
 
-struct Session {
-    session_id: Option<[u8; 10]>,
-    expected_sequence_number: u64,
+pub struct Session {
+    pub session_id: Option<[u8; 10]>,
+    pub expected_sequence_number: u64,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Session {
-    fn new() -> Self {
-        Self { session_id: None, expected_sequence_number: 0 }
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            session_id: None,
+            expected_sequence_number: 0,
+        }
     }
 
-    fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
+    pub fn on_packet(&mut self, packet_header: &MoldUDP64PacketHeader) -> PacketStatus {
         let sequence_number = packet_header.sequence_number;
         let is_end_of_session = packet_header.message_count == 0xFFFF;
-        let advance_by = if is_end_of_session {0} else {packet_header.message_count as u64};
+        let advance_by = if is_end_of_session {
+            0
+        } else {
+            u64::from(packet_header.message_count)
+        };
         let end = sequence_number + advance_by;
 
         if self.session_id != Some(packet_header.session) {
@@ -65,36 +83,65 @@ impl Session {
             return PacketStatus::EndOfSession;
         }
 
-        if sequence_number == self.expected_sequence_number {
-            self.expected_sequence_number = end;
-            PacketStatus::InOrder
-        } else if sequence_number > self.expected_sequence_number {
-            let old_expected_sequence_number = self.expected_sequence_number;
-            let gap = sequence_number - self.expected_sequence_number;
-            self.expected_sequence_number = end;
-            PacketStatus::Gap {
-                start: old_expected_sequence_number,
-                count: gap
+        match sequence_number.cmp(&self.expected_sequence_number) {
+            std::cmp::Ordering::Equal => {
+                self.expected_sequence_number = end;
+                PacketStatus::InOrder
             }
-        } else {
-            // Assume that retransmission requests cover exactly the requested
-            // range, so that even if there is partial overlap, it counts as
-            // fully stale
-            PacketStatus::StaleOrDuplicate
+            std::cmp::Ordering::Greater => {
+                let old_expected_sequence_number = self.expected_sequence_number;
+                let gap = sequence_number - self.expected_sequence_number;
+                self.expected_sequence_number = end;
+                PacketStatus::Gap {
+                    start: old_expected_sequence_number,
+                    count: gap,
+                }
+            }
+            std::cmp::Ordering::Less => {
+                // Assume that retransmission requests cover exactly the requested
+                // range, so that even if there is partial overlap, it counts as
+                // fully stale
+                PacketStatus::StaleOrDuplicate
+            }
         }
     }
 }
 
-fn build_packet(session: [u8; 10], sequence_number: u64, messages: &[&[u8]]) -> Vec<u8> {
-    let message_count = messages.len() as u16;
+/// Builds a `MoldUDP64` packet from the given messages.
+///
+/// # Panics
+///
+/// Panics if `messages.len()` exceeds `u16::MAX`, if any individual message
+/// exceeds `u16::MAX` bytes, or if `messages.len()` is exactly `0xFFFF`
+/// (reserved for End of Session).
+#[must_use]
+pub fn build_packet(session: [u8; 10], sequence_number: u64, messages: &[&[u8]]) -> Vec<u8> {
+    let message_count = u16::try_from(messages.len())
+        .expect("message count exceeds u16::MAX (MoldUDP64 message_count is a u16)");
+    assert_ne!(
+        message_count, 0xFFFF,
+        "message_count 0xFFFF is reserved for End of Session"
+    );
+
     let mut buf = Vec::with_capacity(20);
     buf.extend_from_slice(&session);
     buf.extend_from_slice(&sequence_number.to_be_bytes());
     buf.extend_from_slice(&message_count.to_be_bytes());
     for message in messages {
-        buf.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        let message_length = u16::try_from(message.len())
+            .expect("message length exceeds u16::MAX (MoldUDP64 message length is a u16)");
+        buf.extend_from_slice(&message_length.to_be_bytes());
         buf.extend_from_slice(message);
     }
+    buf
+}
+
+#[must_use]
+pub fn build_end_of_session_packet(session: [u8; 10], sequence_number: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
+    buf.extend_from_slice(&session);
+    buf.extend_from_slice(&sequence_number.to_be_bytes());
+    buf.extend_from_slice(&0xFFFFu16.to_be_bytes());
     buf
 }
 
@@ -130,11 +177,14 @@ mod tests {
         packet.extend_from_slice(b"trailing");
 
         let (header, rest) = parse_header(&packet).expect("should parse");
-        assert_eq!(header, MoldUDP64PacketHeader {
-            session: session_id(1),
-            sequence_number: 42,
-            message_count: 3,
-        });
+        assert_eq!(
+            header,
+            MoldUDP64PacketHeader {
+                session: session_id(1),
+                sequence_number: 42,
+                message_count: 3,
+            }
+        );
         assert_eq!(rest, b"trailing");
     }
 
@@ -215,7 +265,11 @@ mod tests {
     #[test]
     fn first_packet_reports_new_session_with_no_previous() {
         let mut session = Session::new();
-        let header = MoldUDP64PacketHeader { session: session_id(1), sequence_number: 100, message_count: 5 };
+        let header = MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 100,
+            message_count: 5,
+        };
 
         let status = session.on_packet(&header);
 
@@ -226,9 +280,17 @@ mod tests {
     #[test]
     fn in_order_packet_advances_expected_sequence_number() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 });
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        });
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 5, message_count: 3 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 5,
+            message_count: 3,
+        });
 
         assert_eq!(status, PacketStatus::InOrder);
         assert_eq!(session.expected_sequence_number, 8);
@@ -237,10 +299,18 @@ mod tests {
     #[test]
     fn heartbeat_with_matching_sequence_is_in_order_and_does_not_advance() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 });
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        });
 
         // heartbeat: message_count 0, sequence_number == next expected
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 5, message_count: 0 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 5,
+            message_count: 0,
+        });
 
         assert_eq!(status, PacketStatus::InOrder);
         assert_eq!(session.expected_sequence_number, 5);
@@ -249,9 +319,17 @@ mod tests {
     #[test]
     fn gap_reports_start_and_count_and_advances_past_it() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5 next
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5 next
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 10, message_count: 2 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 10,
+            message_count: 2,
+        });
 
         assert_eq!(status, PacketStatus::Gap { start: 5, count: 5 });
         assert_eq!(session.expected_sequence_number, 12);
@@ -260,9 +338,17 @@ mod tests {
     #[test]
     fn stale_or_duplicate_does_not_move_expected_sequence_number() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5 next
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5 next
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        });
 
         assert_eq!(status, PacketStatus::StaleOrDuplicate);
         assert_eq!(session.expected_sequence_number, 5);
@@ -271,9 +357,17 @@ mod tests {
     #[test]
     fn end_of_session_does_not_move_expected_sequence_number() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5 next
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5 next
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 5, message_count: 0xFFFF });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 5,
+            message_count: 0xFFFF,
+        });
 
         assert_eq!(status, PacketStatus::EndOfSession);
         assert_eq!(session.expected_sequence_number, 5);
@@ -282,11 +376,24 @@ mod tests {
     #[test]
     fn session_change_mid_stream_reports_previous_and_reseeds_expected() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 });
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        });
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(2), sequence_number: 50, message_count: 2 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(2),
+            sequence_number: 50,
+            message_count: 2,
+        });
 
-        assert_eq!(status, PacketStatus::NewSession { previous: Some(session_id(1)) });
+        assert_eq!(
+            status,
+            PacketStatus::NewSession {
+                previous: Some(session_id(1))
+            }
+        );
         assert_eq!(session.expected_sequence_number, 52);
     }
 
@@ -294,7 +401,9 @@ mod tests {
     fn first_packet_being_end_of_session_does_not_corrupt_expected_sequence_number() {
         let mut session = Session::new();
         let status = session.on_packet(&MoldUDP64PacketHeader {
-            session: session_id(1), sequence_number: 100, message_count: 0xFFFF,
+            session: session_id(1),
+            sequence_number: 100,
+            message_count: 0xFFFF,
         });
 
         assert_eq!(status, PacketStatus::NewSession { previous: None });
@@ -304,29 +413,56 @@ mod tests {
     #[test]
     fn new_sessions_first_packet_being_end_of_session_does_not_corrupt_expected_sequence_number() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 });
-
-        let status = session.on_packet(&MoldUDP64PacketHeader {
-            session: session_id(2), sequence_number: 200, message_count: 0xFFFF,
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
         });
 
-        assert_eq!(status, PacketStatus::NewSession { previous: Some(session_id(1)) });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(2),
+            sequence_number: 200,
+            message_count: 0xFFFF,
+        });
+
+        assert_eq!(
+            status,
+            PacketStatus::NewSession {
+                previous: Some(session_id(1))
+            }
+        );
         assert_eq!(session.expected_sequence_number, 200);
     }
 
     #[test]
     fn end_of_session_takes_priority_over_gap_and_stale_sequence_values() {
         let mut ahead = Session::new();
-        ahead.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5
+        ahead.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5
         assert_eq!(
-            ahead.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 50, message_count: 0xFFFF }),
+            ahead.on_packet(&MoldUDP64PacketHeader {
+                session: session_id(1),
+                sequence_number: 50,
+                message_count: 0xFFFF
+            }),
             PacketStatus::EndOfSession
         );
 
         let mut behind = Session::new();
-        behind.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5
+        behind.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5
         assert_eq!(
-            behind.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 2, message_count: 0xFFFF }),
+            behind.on_packet(&MoldUDP64PacketHeader {
+                session: session_id(1),
+                sequence_number: 2,
+                message_count: 0xFFFF
+            }),
             PacketStatus::EndOfSession
         );
     }
@@ -334,9 +470,17 @@ mod tests {
     #[test]
     fn heartbeat_ahead_of_expected_reports_gap() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 9, message_count: 0 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 9,
+            message_count: 0,
+        });
 
         assert_eq!(status, PacketStatus::Gap { start: 5, count: 4 });
         assert_eq!(session.expected_sequence_number, 9);
@@ -345,9 +489,17 @@ mod tests {
     #[test]
     fn duplicate_heartbeat_is_stale_and_does_not_advance() {
         let mut session = Session::new();
-        session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 1, message_count: 4 }); // expects 5
+        session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 1,
+            message_count: 4,
+        }); // expects 5
 
-        let status = session.on_packet(&MoldUDP64PacketHeader { session: session_id(1), sequence_number: 3, message_count: 0 });
+        let status = session.on_packet(&MoldUDP64PacketHeader {
+            session: session_id(1),
+            sequence_number: 3,
+            message_count: 0,
+        });
 
         assert_eq!(status, PacketStatus::StaleOrDuplicate);
         assert_eq!(session.expected_sequence_number, 5);
