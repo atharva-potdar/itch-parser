@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 
 pub trait PacketSource {
@@ -32,6 +33,37 @@ impl PacketSource for FilePacketSource {
         self.reader.read_exact(&mut packet)?;
 
         Ok(Some(packet))
+    }
+}
+
+const MAX_UDP_DATAGRAM_SIZE: usize = 65_536;
+
+pub struct UdpPacketSource {
+    socket: UdpSocket,
+}
+
+impl UdpPacketSource {
+    pub fn join_multicast(
+        multicast_addr: Ipv4Addr,
+        port: u16,
+        interface: Ipv4Addr,
+    ) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))?;
+        socket.join_multicast_v4(&multicast_addr, &interface)?;
+        Ok(Self { socket })
+    }
+
+    pub fn bind(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
+        Ok(Self { socket: UdpSocket::bind(addr)? })
+    }
+}
+
+impl PacketSource for UdpPacketSource {
+    fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+        let (received, _origin) = self.socket.recv_from(&mut buf)?;
+        buf.truncate(received);
+        Ok(Some(buf))
     }
 }
 
