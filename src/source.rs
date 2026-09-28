@@ -4,6 +4,11 @@ use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 
 pub trait PacketSource {
+    /// # Errors
+    ///
+    /// Returns an error if the underlying transport fails while producing
+    /// the next packet (e.g. an I/O error reading the file, or a socket
+    /// error on `recv_from`).
     fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>>;
 }
 
@@ -12,9 +17,15 @@ pub struct FilePacketSource {
 }
 
 impl FilePacketSource {
+    /// # Errors
+    ///
+    /// Returns an error if the file at `path` cannot be opened (e.g. it
+    /// does not exist or the process lacks permission to read it).
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let file = File::open(path)?;
-        Ok(Self { reader: BufReader::new(file) })
+        Ok(Self {
+            reader: BufReader::new(file),
+        })
     }
 }
 
@@ -43,6 +54,10 @@ pub struct UdpPacketSource {
 }
 
 impl UdpPacketSource {
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be bound to `port`, or if
+    /// joining the multicast group `multicast_addr` on `interface` fails.
     pub fn join_multicast(
         multicast_addr: Ipv4Addr,
         port: u16,
@@ -53,8 +68,13 @@ impl UdpPacketSource {
         Ok(Self { socket })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be bound to `addr`.
     pub fn bind(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        Ok(Self { socket: UdpSocket::bind(addr)? })
+        Ok(Self {
+            socket: UdpSocket::bind(addr)?,
+        })
     }
 }
 
@@ -67,6 +87,14 @@ impl PacketSource for UdpPacketSource {
     }
 }
 
+/// # Errors
+///
+/// Returns an error if `path` cannot be created, or if writing any
+/// packet's length prefix or bytes fails.
+///
+/// # Panics
+///
+/// Panics if any packet's length exceeds `u32::MAX` bytes.
 pub fn write_packets_to_file(path: impl AsRef<Path>, packets: &[Vec<u8>]) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -110,8 +138,8 @@ mod tests {
             build_packet(session, 4, &[]), // heartbeat: zero messages
         ];
 
-        let path = std::env::temp_dir()
-            .join(format!("moldudp64_fixture_{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("moldudp64_fixture_{}.bin", std::process::id()));
         let _guard = TempFileGuard(path.clone());
 
         {

@@ -1,12 +1,11 @@
-use itch_parser::{build_end_of_session_packet, build_packet};
 use itch_parser::source::write_packets_to_file;
+use itch_parser::{build_end_of_session_packet, build_packet};
 use std::path::PathBuf;
 
 fn main() -> std::io::Result<()> {
     let out_path = std::env::args()
         .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("fixture.bin"));
+        .map_or_else(|| PathBuf::from("fixture.bin"), PathBuf::from);
 
     let session_id = *b"SESSION001";
 

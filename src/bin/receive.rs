@@ -1,6 +1,6 @@
+use itch_parser::Session;
 use itch_parser::run_pipeline;
 use itch_parser::source::UdpPacketSource;
-use itch_parser::Session;
 use std::net::Ipv4Addr;
 
 fn main() -> std::io::Result<()> {

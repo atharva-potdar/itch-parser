@@ -159,6 +159,10 @@ pub fn build_end_of_session_packet(session: [u8; 10], sequence_number: u64) -> V
     buf
 }
 
+/// # Errors
+///
+/// Returns an error if `source.next_packet()` fails while reading the
+/// stream.
 pub fn run_pipeline(
     mut source: impl PacketSource,
     session: &mut Session,

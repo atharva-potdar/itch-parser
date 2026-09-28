@@ -1,5 +1,5 @@
-use itch_parser::{build_end_of_session_packet, build_packet, Session, run_pipeline};
-use itch_parser::source::{write_packets_to_file, FilePacketSource};
+use itch_parser::source::{FilePacketSource, write_packets_to_file};
+use itch_parser::{Session, build_end_of_session_packet, build_packet, run_pipeline};
 
 fn main() -> std::io::Result<()> {
     let session_id = *b"SESSION001";
