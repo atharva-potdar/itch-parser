@@ -4,12 +4,18 @@ use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 
 pub trait PacketSource {
+    /// Reads the next packet's bytes into `buf`, overwriting its contents.
+    /// Returns `Ok(Some(n))` where the first `n` bytes of `buf` are the
+    /// packet, or `Ok(None)` if the source is exhausted (end of file /
+    /// no more data expected). Bytes in `buf` beyond index `n` are
+    /// unspecified and must not be relied upon.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying transport fails while producing
     /// the next packet (e.g. an I/O error reading the file, or a socket
     /// error on `recv_from`).
-    fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>>;
+    fn next_packet(&mut self, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>>;
 }
 
 pub struct FilePacketSource {
@@ -30,20 +36,17 @@ impl FilePacketSource {
 }
 
 impl PacketSource for FilePacketSource {
-    fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    fn next_packet(&mut self, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
         let mut length_buf = [0u8; 4];
-
         match self.reader.read_exact(&mut length_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         }
-
         let packet_length = u32::from_be_bytes(length_buf) as usize;
-        let mut packet = vec![0u8; packet_length];
-        self.reader.read_exact(&mut packet)?;
-
-        Ok(Some(packet))
+        buf.resize(packet_length, 0);
+        self.reader.read_exact(buf)?;
+        Ok(Some(packet_length))
     }
 }
 
@@ -79,11 +82,11 @@ impl UdpPacketSource {
 }
 
 impl PacketSource for UdpPacketSource {
-    fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
-        let (received, _origin) = self.socket.recv_from(&mut buf)?;
+    fn next_packet(&mut self, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
+        buf.resize(MAX_UDP_DATAGRAM_SIZE, 0);
+        let (received, _origin) = self.socket.recv_from(buf)?;
         buf.truncate(received);
-        Ok(Some(buf))
+        Ok(Some(received))
     }
 }
 
@@ -152,17 +155,20 @@ mod tests {
         }
 
         let mut source = FilePacketSource::open(&path).expect("should open fixture file");
+        let mut buf = Vec::new();
 
         for expected in &original_packets {
-            let actual = source
-                .next_packet()
+            let received = source
+                .next_packet(&mut buf)
                 .expect("should read without I/O error")
                 .expect("should yield a packet, not None");
-            assert_eq!(&actual, expected);
+            assert_eq!(&buf[..received], expected.as_slice());
         }
 
         assert_eq!(
-            source.next_packet().expect("should read without I/O error"),
+            source
+                .next_packet(&mut buf)
+                .expect("should read without I/O error"),
             None,
             "source should report exhaustion after the last real packet"
         );

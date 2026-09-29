@@ -137,16 +137,20 @@ pub fn build_packet(session: [u8; 10], sequence_number: u64, messages: &[&[u8]])
         "message_count 0xFFFF is reserved for End of Session"
     );
 
-    let mut buf = Vec::with_capacity(20);
+    let payload_len: usize = messages.iter().map(|m| 2 + m.len()).sum();
+    let mut buf = Vec::with_capacity(20 + payload_len);
+
     buf.extend_from_slice(&session);
     buf.extend_from_slice(&sequence_number.to_be_bytes());
     buf.extend_from_slice(&message_count.to_be_bytes());
+
     for message in messages {
         let message_length = u16::try_from(message.len())
             .expect("message length exceeds u16::MAX (MoldUDP64 message length is a u16)");
         buf.extend_from_slice(&message_length.to_be_bytes());
         buf.extend_from_slice(message);
     }
+
     buf
 }
 
@@ -169,8 +173,11 @@ pub fn run_pipeline(
     mut on_status: impl FnMut(&MoldUDP64PacketHeader, &PacketStatus),
     mut on_message: impl FnMut(&[u8]),
 ) -> std::io::Result<()> {
-    while let Some(packet) = source.next_packet()? {
-        let Some((header, body)) = parse_header(&packet) else {
+    let mut buf = Vec::new();
+
+    while let Some(received) = source.next_packet(&mut buf)? {
+        let packet = &buf[..received];
+        let Some((header, body)) = parse_header(packet) else {
             continue; // malformed packet; skip rather than abort the whole stream
         };
 

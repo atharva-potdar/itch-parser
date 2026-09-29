@@ -32,8 +32,11 @@ fn main() -> std::io::Result<()> {
     let mut source = FilePacketSource::open(&fixture_path)?;
     let mut sent = 0usize;
 
-    while let Some(packet) = source.next_packet()? {
-        socket.send_to(&packet, target)?;
+    let mut buf = Vec::new();
+
+    while let Some(received) = source.next_packet(&mut buf)? {
+        let packet = &buf[..received];
+        socket.send_to(packet, target)?;
         sent += 1;
         println!("sent packet {sent} ({} bytes) to {target}", packet.len());
     }
