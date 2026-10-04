@@ -12,6 +12,11 @@ pub enum MessageType {
     OperationalHalt,           // 'h'
     AddOrder,                  // 'A'
     AddOrderMPIDAttribution,   // 'F'
+    OrderExecuted,             // 'E'
+    OrderExecutedPrice,        // 'C'
+    OrderCancel,               // 'X'
+    OrderDelete,               // 'D'
+    OrderReplace               // 'U'
 }
 
 impl MessageType {
@@ -30,6 +35,11 @@ impl MessageType {
             b'h' => Some(Self::OperationalHalt),
             b'A' => Some(Self::AddOrder),
             b'F' => Some(Self::AddOrderMPIDAttribution),
+            b'E' => Some(Self::OrderExecuted),
+            b'C' => Some(Self::OrderExecutedPrice),
+            b'X' => Some(Self::OrderCancel),
+            b'D' => Some(Self::OrderDelete),
+            b'U' => Some(Self::OrderReplace),
             _ => None,
         }
     }
@@ -175,6 +185,56 @@ pub struct AddOrderMPIDAttributionMessage {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct OrderExecutedMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub order_reference_number: u64,
+    pub executed_shares: u32,
+    pub match_number: u64
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct OrderExecutedPriceMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub order_reference_number: u64,
+    pub executed_shares: u32,
+    pub match_number: u64,
+    pub printable: u8,
+    pub execution_price: u32
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct OrderCancelMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub order_reference_number: u64,
+    pub cancelled_shares: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct OrderDeleteMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub order_reference_number: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct OrderReplaceMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub original_order_reference_number: u64,
+    pub new_order_reference_number: u64,
+    pub shares: u32,
+    pub price: u32
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ParsedMessage {
     SystemEvent(SystemEventMessage),
     StockDirectory(StockDirectoryMessage),
@@ -188,6 +248,11 @@ pub enum ParsedMessage {
     OperationalHalt(OperationalHaltMessage),
     AddOrder(AddOrderMessage),
     AddOrderMPIDAttribution(AddOrderMPIDAttributionMessage),
+    OrderExecuted(OrderExecutedMessage),
+    OrderExecutedPrice(OrderExecutedPriceMessage),
+    OrderCancel(OrderCancelMessage),
+    OrderDelete(OrderDeleteMessage),
+    OrderReplace(OrderReplaceMessage),
 }
 
 #[must_use]
@@ -224,6 +289,21 @@ pub fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
         MessageType::AddOrderMPIDAttribution => {
             parse_add_order_mpid_attribution(message).map(ParsedMessage::AddOrderMPIDAttribution)
         }
+        MessageType::OrderExecuted => {
+            parse_order_executed(message).map(ParsedMessage::OrderExecuted)
+        }
+        MessageType::OrderExecutedPrice => {
+            parse_order_executed_price(message).map(ParsedMessage::OrderExecutedPrice)
+        }
+        MessageType::OrderCancel => {
+            parse_order_cancel(message).map(ParsedMessage::OrderCancel)
+        }
+        MessageType::OrderDelete => {
+            parse_order_delete(message).map(ParsedMessage::OrderDelete)
+        }
+        MessageType::OrderReplace => {
+            parse_order_replace(message).map(ParsedMessage::OrderReplace)
+        }
     }
 }
 
@@ -247,6 +327,11 @@ pub const LULD_ACTION_MESSAGE_LEN: usize = 35;
 pub const OPERATIONAL_HALT_MESSAGE_LEN: usize = 21;
 pub const ADD_ORDER_MESSAGE_LEN: usize = 36;
 pub const ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN: usize = 40;
+pub const ORDER_EXECUTED_MESSAGE_LEN: usize = 31;
+pub const ORDER_EXECUTED_PRICE_MESSAGE_LEN: usize = 36;
+pub const ORDER_CANCEL_MESSAGE_LEN: usize = 23;
+pub const ORDER_DELETE_MESSAGE_LEN: usize = 19;
+pub const ORDER_REPLACE_MESSAGE_LEN: usize = 35;
 
 #[must_use]
 pub fn parse_system_event(message: &[u8]) -> Option<SystemEventMessage> {
@@ -644,6 +729,238 @@ pub fn parse_add_order_mpid_attribution(message: &[u8]) -> Option<AddOrderMPIDAt
         stock,
         price,
         attribution,
+    })
+}
+
+#[must_use]
+pub fn parse_order_executed(message: &[u8]) -> Option<OrderExecutedMessage> {
+    if message.len() != ORDER_EXECUTED_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'E' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let executed_shares = u32::from_be_bytes([
+        message[19],
+        message[20],
+        message[21],
+        message[22],
+    ]);
+    let match_number = u64::from_be_bytes([
+        message[23],
+        message[24],
+        message[25],
+        message[26],
+        message[27],
+        message[28],
+        message[29],
+        message[30],
+    ]);
+
+    Some(OrderExecutedMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        order_reference_number,
+        executed_shares,
+        match_number,
+    })
+}
+
+#[must_use]
+pub fn parse_order_executed_price(message: &[u8]) -> Option<OrderExecutedPriceMessage> {
+    if message.len() != ORDER_EXECUTED_PRICE_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'C' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let executed_shares = u32::from_be_bytes([
+        message[19],
+        message[20],
+        message[21],
+        message[22],
+    ]);
+    let match_number = u64::from_be_bytes([
+        message[23],
+        message[24],
+        message[25],
+        message[26],
+        message[27],
+        message[28],
+        message[29],
+        message[30],
+    ]);
+    let printable = message[31];
+    let execution_price = u32::from_be_bytes([
+        message[32],
+        message[33],
+        message[34],
+        message[35],
+    ]);
+
+    Some(OrderExecutedPriceMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        order_reference_number,
+        executed_shares,
+        match_number,
+        printable,
+        execution_price,
+    })
+}
+
+#[must_use]
+pub fn parse_order_cancel(message: &[u8]) -> Option<OrderCancelMessage> {
+    if message.len() != ORDER_CANCEL_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'X' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let cancelled_shares = u32::from_be_bytes([
+        message[19],
+        message[20],
+        message[21],
+        message[22],
+    ]);
+
+    Some(OrderCancelMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        order_reference_number,
+        cancelled_shares
+    })
+}
+
+#[must_use]
+pub fn parse_order_delete(message: &[u8]) -> Option<OrderDeleteMessage> {
+    if message.len() != ORDER_DELETE_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'D' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+
+    Some(OrderDeleteMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        order_reference_number
+    })
+}
+
+#[must_use]
+pub fn parse_order_replace(message: &[u8]) -> Option<OrderReplaceMessage> {
+    if message.len() != ORDER_REPLACE_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'U' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let original_order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let new_order_reference_number = u64::from_be_bytes([
+        message[19],
+        message[20],
+        message[21],
+        message[22],
+        message[23],
+        message[24],
+        message[25],
+        message[26],
+    ]);
+    let shares = u32::from_be_bytes([
+        message[27],
+        message[28],
+        message[29],
+        message[30],
+    ]);
+    let price = u32::from_be_bytes([
+        message[31],
+        message[32],
+        message[33],
+        message[34],
+    ]);
+
+    Some(OrderReplaceMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        original_order_reference_number,
+        new_order_reference_number,
+        shares,
+        price,
     })
 }
 
@@ -1610,6 +1927,311 @@ mod tests {
         );
         bytes.pop();
         assert!(parse_add_order_mpid_attribution(&bytes).is_none());
+    }
+
+    // ---- OrderExecutedMessage ----
+
+    fn order_executed_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        order_reference_number: u64,
+        executed_shares: u32,
+        match_number: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ORDER_EXECUTED_MESSAGE_LEN);
+        buf.push(b'E');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&order_reference_number.to_be_bytes());
+        buf.extend_from_slice(&executed_shares.to_be_bytes());
+        buf.extend_from_slice(&match_number.to_be_bytes());
+        assert_eq!(buf.len(), ORDER_EXECUTED_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_order_executed_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let order_reference_number = 0x1122_3344_5566_7788u64;
+        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
+        let bytes = order_executed_bytes(0x1111, 0x2222, timestamp, order_reference_number, 200, match_number);
+
+        let parsed = parse_order_executed(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            OrderExecutedMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                order_reference_number,
+                executed_shares: 200,
+                match_number,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_order_executed_wrong_type_byte_returns_none() {
+        let mut bytes = order_executed_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 200, 0x99AA_BBCC_DDEE_FF00);
+        bytes[0] = b'Z';
+        assert!(parse_order_executed(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_order_executed_truncated_returns_none() {
+        let mut bytes = order_executed_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 200, 0x99AA_BBCC_DDEE_FF00);
+        bytes.pop();
+        assert!(parse_order_executed(&bytes).is_none());
+    }
+
+    // ---- OrderExecutedPriceMessage ----
+
+    #[allow(clippy::too_many_arguments)] // test-only builder, mirrors the wire format 1:1
+    fn order_executed_price_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        order_reference_number: u64,
+        executed_shares: u32,
+        match_number: u64,
+        printable: u8,
+        execution_price: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ORDER_EXECUTED_PRICE_MESSAGE_LEN);
+        buf.push(b'C');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&order_reference_number.to_be_bytes());
+        buf.extend_from_slice(&executed_shares.to_be_bytes());
+        buf.extend_from_slice(&match_number.to_be_bytes());
+        buf.push(printable);
+        buf.extend_from_slice(&execution_price.to_be_bytes());
+        assert_eq!(buf.len(), ORDER_EXECUTED_PRICE_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_order_executed_price_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let order_reference_number = 0x1122_3344_5566_7788u64;
+        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
+        let bytes = order_executed_price_bytes(
+            0x1111, 0x2222, timestamp, order_reference_number, 200, match_number, b'Y', 1_425_000,
+        );
+
+        let parsed = parse_order_executed_price(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            OrderExecutedPriceMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                order_reference_number,
+                executed_shares: 200,
+                match_number,
+                printable: b'Y',
+                execution_price: 1_425_000,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_order_executed_price_wrong_type_byte_returns_none() {
+        let mut bytes = order_executed_price_bytes(
+            1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 200, 0x99AA_BBCC_DDEE_FF00, b'Y', 1_425_000,
+        );
+        bytes[0] = b'Z';
+        assert!(parse_order_executed_price(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_order_executed_price_truncated_returns_none() {
+        let mut bytes = order_executed_price_bytes(
+            1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 200, 0x99AA_BBCC_DDEE_FF00, b'Y', 1_425_000,
+        );
+        bytes.pop();
+        assert!(parse_order_executed_price(&bytes).is_none());
+    }
+
+    // ---- OrderCancelMessage ----
+
+    fn order_cancel_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        order_reference_number: u64,
+        cancelled_shares: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ORDER_CANCEL_MESSAGE_LEN);
+        buf.push(b'X');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&order_reference_number.to_be_bytes());
+        buf.extend_from_slice(&cancelled_shares.to_be_bytes());
+        assert_eq!(buf.len(), ORDER_CANCEL_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_order_cancel_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let order_reference_number = 0x1122_3344_5566_7788u64;
+        let bytes = order_cancel_bytes(0x1111, 0x2222, timestamp, order_reference_number, 150);
+
+        let parsed = parse_order_cancel(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            OrderCancelMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                order_reference_number,
+                cancelled_shares: 150,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_order_cancel_wrong_type_byte_returns_none() {
+        let mut bytes = order_cancel_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 150);
+        bytes[0] = b'Z';
+        assert!(parse_order_cancel(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_order_cancel_truncated_returns_none() {
+        let mut bytes = order_cancel_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 150);
+        bytes.pop();
+        assert!(parse_order_cancel(&bytes).is_none());
+    }
+
+    // ---- OrderDeleteMessage ----
+
+    fn order_delete_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        order_reference_number: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ORDER_DELETE_MESSAGE_LEN);
+        buf.push(b'D');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&order_reference_number.to_be_bytes());
+        assert_eq!(buf.len(), ORDER_DELETE_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_order_delete_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let order_reference_number = 0x1122_3344_5566_7788u64;
+        let bytes = order_delete_bytes(0x1111, 0x2222, timestamp, order_reference_number);
+
+        let parsed = parse_order_delete(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            OrderDeleteMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                order_reference_number,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_order_delete_wrong_type_byte_returns_none() {
+        let mut bytes = order_delete_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788);
+        bytes[0] = b'Z';
+        assert!(parse_order_delete(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_order_delete_truncated_returns_none() {
+        let mut bytes = order_delete_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788);
+        bytes.pop();
+        assert!(parse_order_delete(&bytes).is_none());
+    }
+
+    // ---- OrderReplaceMessage ----
+
+    fn order_replace_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        original_order_reference_number: u64,
+        new_order_reference_number: u64,
+        shares: u32,
+        price: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ORDER_REPLACE_MESSAGE_LEN);
+        buf.push(b'U');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&original_order_reference_number.to_be_bytes());
+        buf.extend_from_slice(&new_order_reference_number.to_be_bytes());
+        buf.extend_from_slice(&shares.to_be_bytes());
+        buf.extend_from_slice(&price.to_be_bytes());
+        assert_eq!(buf.len(), ORDER_REPLACE_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_order_replace_valid() {
+        // original/new order reference numbers are adjacent 8-byte fields --
+        // distinct values catch an offset slip between them, same reasoning
+        // as every other adjacent-field pair tested so far.
+        let timestamp = 0x0102_0304_0506u64;
+        let original_order_reference_number = 0x1111_1111_1111_1111u64;
+        let new_order_reference_number = 0x2222_2222_2222_2222u64;
+        let bytes = order_replace_bytes(
+            0x1111, 0x2222, timestamp, original_order_reference_number, new_order_reference_number,
+            400, 1_500_000,
+        );
+
+        let parsed = parse_order_replace(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            OrderReplaceMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                original_order_reference_number,
+                new_order_reference_number,
+                shares: 400,
+                price: 1_500_000,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_order_replace_wrong_type_byte_returns_none() {
+        let mut bytes = order_replace_bytes(
+            1, 2, 0x0102_0304_0506, 0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 400, 1_500_000,
+        );
+        bytes[0] = b'Z';
+        assert!(parse_order_replace(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_order_replace_truncated_returns_none() {
+        let mut bytes = order_replace_bytes(
+            1, 2, 0x0102_0304_0506, 0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 400, 1_500_000,
+        );
+        bytes.pop();
+        assert!(parse_order_replace(&bytes).is_none());
     }
 }
 // </Generated by Claude.ai>
