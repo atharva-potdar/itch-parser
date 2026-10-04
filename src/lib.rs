@@ -11,56 +11,30 @@ pub struct MoldUDP64PacketHeader {
 
 #[must_use]
 pub fn parse_header(body: &[u8]) -> Option<(MoldUDP64PacketHeader, &[u8])> {
-    if body.len() < 20 {
-        return None;
-    }
-
-    let ptr = body.as_ptr();
-
-    // SAFETY: We checked body.len() >= 20 above, so reading 10 bytes at offset 0,
-    // 8 bytes at offset 10, and 2 bytes at offset 18 are all guaranteed strictly in-bounds.
-    let session = unsafe { ptr.cast::<[u8; 10]>().read_unaligned() };
-    let sequence_number = u64::from_be(unsafe { ptr.add(10).cast::<u64>().read_unaligned() });
-    let message_count = u16::from_be(unsafe { ptr.add(18).cast::<u16>().read_unaligned() });
-
+    let (message_header, message_body) = body.split_at_checked(20)?;
     Some((
         MoldUDP64PacketHeader {
-            session,
-            sequence_number,
-            message_count,
+            session: message_header[..10].try_into().ok()?,
+            sequence_number: u64::from_be_bytes(message_header[10..18].try_into().ok()?),
+            message_count: u16::from_be_bytes(message_header[18..20].try_into().ok()?),
         },
-        &body[20..],
+        message_body,
     ))
 }
 
 pub fn parse_messages(message_body: &[u8], message_count: u16, mut handle: impl FnMut(&[u8])) {
-    let mut ptr = message_body.as_ptr();
-    let mut rem = message_body.len();
-
+    let mut buf = message_body;
     for _ in 0..message_count {
-        if rem < 2 {
+        let Some((message_length_bytes, rest)) = buf.split_at_checked(2) else {
             return;
-        }
-
-        // SAFETY: rem >= 2, so reading 2 bytes is in-bounds.
-        let message_length = u16::from_be(unsafe { ptr.cast::<u16>().read_unaligned() }) as usize;
-
-        // SAFETY: we just verified we have at least 2 bytes.
-        ptr = unsafe { ptr.add(2) };
-        rem -= 2;
-
-        if rem < message_length {
+        };
+        let message_length =
+            u16::from_be_bytes([message_length_bytes[0], message_length_bytes[1]]) as usize;
+        let Some((message_data, rest)) = rest.split_at_checked(message_length) else {
             return;
-        }
-
-        // SAFETY: We verified `rem >= message_length`. `ptr` is valid, and the memory
-        // range `ptr` to `ptr + message_length` is initialized and within the original slice.
-        let message_data = unsafe { std::slice::from_raw_parts(ptr, message_length) };
+        };
         handle(message_data);
-
-        // SAFETY: we verified we have at least `message_length` bytes.
-        ptr = unsafe { ptr.add(message_length) };
-        rem -= message_length;
+        buf = rest;
     }
 }
 
