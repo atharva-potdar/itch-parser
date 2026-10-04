@@ -1,4 +1,4 @@
-use itch_parser::{parse_header, parse_messages, PacketStatus, Session};
+use itch_parser::{PacketStatus, Session, parse_header, parse_messages};
 use std::hint::black_box;
 use std::process::exit;
 use std::time::Instant;
@@ -25,10 +25,18 @@ fn make_hot_path_packets(session_id: [u8; 10]) -> (Vec<u8>, Vec<(usize, usize)>)
         buffer.extend_from_slice(&sequence_number.to_be_bytes());
         buffer.extend_from_slice(&2u16.to_be_bytes()); // message_count
 
-        buffer.extend_from_slice(&(msg1.len() as u16).to_be_bytes());
+        buffer.extend_from_slice(
+            &u16::try_from(msg1.len())
+                .expect("benchmark message length exceeds u16::MAX")
+                .to_be_bytes(),
+        );
         buffer.extend_from_slice(msg1);
 
-        buffer.extend_from_slice(&(msg2.len() as u16).to_be_bytes());
+        buffer.extend_from_slice(
+            &u16::try_from(msg2.len())
+                .expect("benchmark message length exceeds u16::MAX")
+                .to_be_bytes(),
+        );
         buffer.extend_from_slice(msg2);
 
         ranges.push((start_idx, buffer.len()));
