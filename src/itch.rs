@@ -20,6 +20,9 @@ pub enum MessageType {
     Trade,                     // 'P'
     CrossTrade,                // 'Q'
     BrokenTrade,               // 'B'
+    NOII,                      // 'I'
+    RPII,                      // 'N'
+    DLCRPriceDiscovery,        // 'O'
 }
 
 impl MessageType {
@@ -46,6 +49,9 @@ impl MessageType {
             b'P' => Some(Self::Trade),
             b'Q' => Some(Self::CrossTrade),
             b'B' => Some(Self::BrokenTrade),
+            b'I' => Some(Self::NOII),
+            b'N' => Some(Self::RPII),
+            b'O' => Some(Self::DLCRPriceDiscovery),
             _ => None,
         }
     }
@@ -274,6 +280,46 @@ pub struct BrokenTradeMessage {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct NOIIMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub paired_shares: u64,
+    pub imbalance_shares: u64,
+    pub imbalance_direction: u8,
+    pub stock: [u8; 8],
+    pub far_price: u32,
+    pub near_price: u32,
+    pub current_reference_price: u32,
+    pub cross_type: u8,
+    pub price_variation_indicator: u8,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct RPIIMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub stock: [u8; 8],
+    pub interest_flag: u8,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct DLCRPriceDiscoveryMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub stock: [u8; 8],
+    pub open_eligibility_status: u8,
+    pub minimum_allowable_price: u32,
+    pub maximum_allowable_price: u32,
+    pub near_execution_price: u32,
+    pub near_execution_time: u64, // nanoseconds since midnight
+    pub lower_price_range_collar: u32,
+    pub upper_price_range_collar: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ParsedMessage {
     SystemEvent(SystemEventMessage),
     StockDirectory(StockDirectoryMessage),
@@ -295,6 +341,9 @@ pub enum ParsedMessage {
     Trade(TradeMessage),
     CrossTrade(CrossTradeMessage),
     BrokenTrade(BrokenTradeMessage),
+    NOII(NOIIMessage),
+    RPII(RPIIMessage),
+    DLCRPriceDiscovery(DLCRPriceDiscoveryMessage),
 }
 
 #[must_use]
@@ -343,6 +392,11 @@ pub fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
         MessageType::Trade => parse_trade(message).map(ParsedMessage::Trade),
         MessageType::CrossTrade => parse_cross_trade(message).map(ParsedMessage::CrossTrade),
         MessageType::BrokenTrade => parse_broken_trade(message).map(ParsedMessage::BrokenTrade),
+        MessageType::NOII => parse_noii(message).map(ParsedMessage::NOII),
+        MessageType::RPII => parse_rpii(message).map(ParsedMessage::RPII),
+        MessageType::DLCRPriceDiscovery => {
+            parse_dlcr_price_discovery(message).map(ParsedMessage::DLCRPriceDiscovery)
+        }
     }
 }
 
@@ -374,6 +428,9 @@ pub const ORDER_REPLACE_MESSAGE_LEN: usize = 35;
 pub const TRADE_MESSAGE_LEN: usize = 44;
 pub const CROSS_TRADE_MESSAGE_LEN: usize = 40;
 pub const BROKEN_TRADE_MESSAGE_LEN: usize = 19;
+pub const NOII_MESSAGE_LEN: usize = 50;
+pub const RPII_MESSAGE_LEN: usize = 20;
+pub const DLCR_PRICE_DISCOVERY_MESSAGE_LEN: usize = 48;
 
 #[must_use]
 pub fn parse_system_event(message: &[u8]) -> Option<SystemEventMessage> {
@@ -1102,6 +1159,137 @@ pub fn parse_broken_trade(message: &[u8]) -> Option<BrokenTradeMessage> {
         tracking_number,
         timestamp,
         match_number,
+    })
+}
+
+#[must_use]
+pub fn parse_noii(message: &[u8]) -> Option<NOIIMessage> {
+    if message.len() != NOII_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'I' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let paired_shares = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let imbalance_shares = u64::from_be_bytes([
+        message[19],
+        message[20],
+        message[21],
+        message[22],
+        message[23],
+        message[24],
+        message[25],
+        message[26],
+    ]);
+    let imbalance_direction = message[27];
+    let stock: [u8; 8] = message[28..36].try_into().ok()?;
+    let far_price = u32::from_be_bytes([message[36], message[37], message[38], message[39]]);
+    let near_price = u32::from_be_bytes([message[40], message[41], message[42], message[43]]);
+    let current_reference_price =
+        u32::from_be_bytes([message[44], message[45], message[46], message[47]]);
+    let cross_type = message[48];
+    let price_variation_indicator = message[49];
+
+    Some(NOIIMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        paired_shares,
+        imbalance_shares,
+        imbalance_direction,
+        stock,
+        far_price,
+        near_price,
+        current_reference_price,
+        cross_type,
+        price_variation_indicator,
+    })
+}
+
+#[must_use]
+pub fn parse_rpii(message: &[u8]) -> Option<RPIIMessage> {
+    if message.len() != RPII_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'N' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let stock: [u8; 8] = message[11..19].try_into().ok()?;
+    let interest_flag = message[19];
+
+    Some(RPIIMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        stock,
+        interest_flag,
+    })
+}
+
+#[must_use]
+pub fn parse_dlcr_price_discovery(message: &[u8]) -> Option<DLCRPriceDiscoveryMessage> {
+    if message.len() != DLCR_PRICE_DISCOVERY_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'O' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let stock: [u8; 8] = message[11..19].try_into().ok()?;
+    let open_eligibility_status = message[19];
+    let minimum_allowable_price =
+        u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
+    let maximum_allowable_price =
+        u32::from_be_bytes([message[24], message[25], message[26], message[27]]);
+    let near_execution_price =
+        u32::from_be_bytes([message[28], message[29], message[30], message[31]]);
+    let near_execution_time = u64::from_be_bytes([
+        message[32],
+        message[33],
+        message[34],
+        message[35],
+        message[36],
+        message[37],
+        message[38],
+        message[39],
+    ]);
+    let lower_price_range_collar =
+        u32::from_be_bytes([message[40], message[41], message[42], message[43]]);
+    let upper_price_range_collar =
+        u32::from_be_bytes([message[44], message[45], message[46], message[47]]);
+
+    Some(DLCRPriceDiscoveryMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        stock,
+        open_eligibility_status,
+        minimum_allowable_price,
+        maximum_allowable_price,
+        near_execution_price,
+        near_execution_time,
+        lower_price_range_collar,
+        upper_price_range_collar,
     })
 }
 
@@ -2470,7 +2658,15 @@ mod tests {
         let match_number = 0x99AA_BBCC_DDEE_FF00u64;
         let stock = *b"SPY     ";
         let bytes = trade_bytes(
-            0x1111, 0x2222, timestamp, order_reference_number, b'B', 100, stock, 450_000, match_number,
+            0x1111,
+            0x2222,
+            timestamp,
+            order_reference_number,
+            b'B',
+            100,
+            stock,
+            450_000,
+            match_number,
         );
 
         let parsed = parse_trade(&bytes).expect("should parse");
@@ -2494,7 +2690,14 @@ mod tests {
     #[test]
     fn parse_trade_wrong_type_byte_returns_none() {
         let mut bytes = trade_bytes(
-            1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, b'B', 100, *b"SPY     ", 450_000,
+            1,
+            2,
+            0x0102_0304_0506,
+            0x1122_3344_5566_7788,
+            b'B',
+            100,
+            *b"SPY     ",
+            450_000,
             0x99AA_BBCC_DDEE_FF00,
         );
         bytes[0] = b'Z';
@@ -2504,7 +2707,14 @@ mod tests {
     #[test]
     fn parse_trade_truncated_returns_none() {
         let mut bytes = trade_bytes(
-            1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, b'B', 100, *b"SPY     ", 450_000,
+            1,
+            2,
+            0x0102_0304_0506,
+            0x1122_3344_5566_7788,
+            b'B',
+            100,
+            *b"SPY     ",
+            450_000,
             0x99AA_BBCC_DDEE_FF00,
         );
         bytes.pop();
@@ -2542,7 +2752,16 @@ mod tests {
         let timestamp = 0x0102_0304_0506u64;
         let match_number = 0x99AA_BBCC_DDEE_FF00u64;
         let stock = *b"QQQ     ";
-        let bytes = cross_trade_bytes(0x1111, 0x2222, timestamp, 50_000, stock, 380_000, match_number, b'O');
+        let bytes = cross_trade_bytes(
+            0x1111,
+            0x2222,
+            timestamp,
+            50_000,
+            stock,
+            380_000,
+            match_number,
+            b'O',
+        );
 
         let parsed = parse_cross_trade(&bytes).expect("should parse");
 
@@ -2564,7 +2783,14 @@ mod tests {
     #[test]
     fn parse_cross_trade_wrong_type_byte_returns_none() {
         let mut bytes = cross_trade_bytes(
-            1, 2, 0x0102_0304_0506, 50_000, *b"QQQ     ", 380_000, 0x99AA_BBCC_DDEE_FF00, b'O',
+            1,
+            2,
+            0x0102_0304_0506,
+            50_000,
+            *b"QQQ     ",
+            380_000,
+            0x99AA_BBCC_DDEE_FF00,
+            b'O',
         );
         bytes[0] = b'Z';
         assert!(parse_cross_trade(&bytes).is_none());
@@ -2573,7 +2799,14 @@ mod tests {
     #[test]
     fn parse_cross_trade_truncated_returns_none() {
         let mut bytes = cross_trade_bytes(
-            1, 2, 0x0102_0304_0506, 50_000, *b"QQQ     ", 380_000, 0x99AA_BBCC_DDEE_FF00, b'O',
+            1,
+            2,
+            0x0102_0304_0506,
+            50_000,
+            *b"QQQ     ",
+            380_000,
+            0x99AA_BBCC_DDEE_FF00,
+            b'O',
         );
         bytes.pop();
         assert!(parse_cross_trade(&bytes).is_none());
@@ -2581,7 +2814,12 @@ mod tests {
 
     // ---- BrokenTradeMessage ----
 
-    fn broken_trade_bytes(stock_locate: u16, tracking_number: u16, timestamp: u64, match_number: u64) -> Vec<u8> {
+    fn broken_trade_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        match_number: u64,
+    ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(BROKEN_TRADE_MESSAGE_LEN);
         buf.push(b'B');
         buf.extend_from_slice(&stock_locate.to_be_bytes());
@@ -2623,6 +2861,281 @@ mod tests {
         let mut bytes = broken_trade_bytes(1, 2, 0x0102_0304_0506, 0x99AA_BBCC_DDEE_FF00);
         bytes.pop();
         assert!(parse_broken_trade(&bytes).is_none());
+    }
+
+    // ---- NOIIMessage ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn noii_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        paired_shares: u64,
+        imbalance_shares: u64,
+        imbalance_direction: u8,
+        stock: [u8; 8],
+        far_price: u32,
+        near_price: u32,
+        current_reference_price: u32,
+        cross_type: u8,
+        price_variation_indicator: u8,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(NOII_MESSAGE_LEN);
+        buf.push(b'I');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&paired_shares.to_be_bytes());
+        buf.extend_from_slice(&imbalance_shares.to_be_bytes());
+        buf.push(imbalance_direction);
+        buf.extend_from_slice(&stock);
+        buf.extend_from_slice(&far_price.to_be_bytes());
+        buf.extend_from_slice(&near_price.to_be_bytes());
+        buf.extend_from_slice(&current_reference_price.to_be_bytes());
+        buf.push(cross_type);
+        buf.push(price_variation_indicator);
+        assert_eq!(buf.len(), NOII_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_noii_valid() {
+        // far_price/near_price/current_reference_price are three adjacent
+        // 4-byte fields -- distinct values catch an offset slip among them.
+        let timestamp = 0x0102_0304_0506u64;
+        let stock = *b"IBM     ";
+        let bytes = noii_bytes(
+            0x1111, 0x2222, timestamp, 10_000, 500, b'B', stock, 100_000, 101_000, 100_500, b'O',
+            b'L',
+        );
+
+        let parsed = parse_noii(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            NOIIMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                paired_shares: 10_000,
+                imbalance_shares: 500,
+                imbalance_direction: b'B',
+                stock,
+                far_price: 100_000,
+                near_price: 101_000,
+                current_reference_price: 100_500,
+                cross_type: b'O',
+                price_variation_indicator: b'L',
+            }
+        );
+    }
+
+    #[test]
+    fn parse_noii_wrong_type_byte_returns_none() {
+        let mut bytes = noii_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            10_000,
+            500,
+            b'B',
+            *b"IBM     ",
+            100_000,
+            101_000,
+            100_500,
+            b'O',
+            b'L',
+        );
+        bytes[0] = b'Z';
+        assert!(parse_noii(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_noii_truncated_returns_none() {
+        let mut bytes = noii_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            10_000,
+            500,
+            b'B',
+            *b"IBM     ",
+            100_000,
+            101_000,
+            100_500,
+            b'O',
+            b'L',
+        );
+        bytes.pop();
+        assert!(parse_noii(&bytes).is_none());
+    }
+
+    // ---- RPIIMessage ----
+
+    fn rpii_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        stock: [u8; 8],
+        interest_flag: u8,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(RPII_MESSAGE_LEN);
+        buf.push(b'N');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&stock);
+        buf.push(interest_flag);
+        assert_eq!(buf.len(), RPII_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_rpii_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let stock = *b"ORCL    ";
+        let bytes = rpii_bytes(0x1111, 0x2222, timestamp, stock, b'B');
+
+        let parsed = parse_rpii(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            RPIIMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                stock,
+                interest_flag: b'B',
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rpii_wrong_type_byte_returns_none() {
+        let mut bytes = rpii_bytes(1, 2, 0x0102_0304_0506, *b"ORCL    ", b'B');
+        bytes[0] = b'Z';
+        assert!(parse_rpii(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_rpii_truncated_returns_none() {
+        let mut bytes = rpii_bytes(1, 2, 0x0102_0304_0506, *b"ORCL    ", b'B');
+        bytes.pop();
+        assert!(parse_rpii(&bytes).is_none());
+    }
+
+    // ---- DLCRPriceDiscoveryMessage ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn dlcr_price_discovery_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        stock: [u8; 8],
+        open_eligibility_status: u8,
+        minimum_allowable_price: u32,
+        maximum_allowable_price: u32,
+        near_execution_price: u32,
+        near_execution_time: u64,
+        lower_price_range_collar: u32,
+        upper_price_range_collar: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(DLCR_PRICE_DISCOVERY_MESSAGE_LEN);
+        buf.push(b'O');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&stock);
+        buf.push(open_eligibility_status);
+        buf.extend_from_slice(&minimum_allowable_price.to_be_bytes());
+        buf.extend_from_slice(&maximum_allowable_price.to_be_bytes());
+        buf.extend_from_slice(&near_execution_price.to_be_bytes());
+        buf.extend_from_slice(&near_execution_time.to_be_bytes());
+        buf.extend_from_slice(&lower_price_range_collar.to_be_bytes());
+        buf.extend_from_slice(&upper_price_range_collar.to_be_bytes());
+        assert_eq!(buf.len(), DLCR_PRICE_DISCOVERY_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_dlcr_price_discovery_valid() {
+        // near_execution_time is the first 8-byte, non-u48 "timestamp-shaped"
+        // field in the project -- a distinct, recognizable value here would
+        // catch it accidentally being parsed with read_u48_be instead of a
+        // full 8-byte read.
+        let timestamp = 0x0102_0304_0506u64;
+        let near_execution_time = 0x1122_3344_5566_7788u64;
+        let stock = *b"RIVN    ";
+        let bytes = dlcr_price_discovery_bytes(
+            0x1111,
+            0x2222,
+            timestamp,
+            stock,
+            b'Y',
+            90_000,
+            110_000,
+            100_000,
+            near_execution_time,
+            95_000,
+            105_000,
+        );
+
+        let parsed = parse_dlcr_price_discovery(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            DLCRPriceDiscoveryMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                stock,
+                open_eligibility_status: b'Y',
+                minimum_allowable_price: 90_000,
+                maximum_allowable_price: 110_000,
+                near_execution_price: 100_000,
+                near_execution_time,
+                lower_price_range_collar: 95_000,
+                upper_price_range_collar: 105_000,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_dlcr_price_discovery_wrong_type_byte_returns_none() {
+        let mut bytes = dlcr_price_discovery_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            *b"RIVN    ",
+            b'Y',
+            90_000,
+            110_000,
+            100_000,
+            0x1122_3344_5566_7788,
+            95_000,
+            105_000,
+        );
+        bytes[0] = b'Z';
+        assert!(parse_dlcr_price_discovery(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_dlcr_price_discovery_truncated_returns_none() {
+        let mut bytes = dlcr_price_discovery_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            *b"RIVN    ",
+            b'Y',
+            90_000,
+            110_000,
+            100_000,
+            0x1122_3344_5566_7788,
+            95_000,
+            105_000,
+        );
+        bytes.pop();
+        assert!(parse_dlcr_price_discovery(&bytes).is_none());
     }
 }
 // </Generated by Claude.ai>
