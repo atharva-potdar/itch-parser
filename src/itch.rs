@@ -10,6 +10,8 @@ pub enum MessageType {
     IPOQuotingPeriodUpdate,    // 'K'
     LULDAuctionCollar,         // 'J'
     OperationalHalt,           // 'h'
+    AddOrder,                  // 'A'
+    AddOrderMPIDAttribution,   // 'F'
 }
 
 impl MessageType {
@@ -26,6 +28,8 @@ impl MessageType {
             b'K' => Some(Self::IPOQuotingPeriodUpdate),
             b'J' => Some(Self::LULDAuctionCollar),
             b'h' => Some(Self::OperationalHalt),
+            b'A' => Some(Self::AddOrder),
+            b'F' => Some(Self::AddOrderMPIDAttribution),
             _ => None,
         }
     }
@@ -146,6 +150,31 @@ pub struct OperationalHaltMessage {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct AddOrderMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub order_reference_number: u64,
+    pub buy_sell_indicator: u8,
+    pub shares: u32,
+    pub stock: [u8; 8],
+    pub price: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct AddOrderMPIDAttributionMessage {
+    pub stock_locate: u16,
+    pub tracking_number: u16,
+    pub timestamp: u64,
+    pub order_reference_number: u64,
+    pub buy_sell_indicator: u8,
+    pub shares: u32,
+    pub stock: [u8; 8],
+    pub price: u32,
+    pub attribution: [u8; 4],
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ParsedMessage {
     SystemEvent(SystemEventMessage),
     StockDirectory(StockDirectoryMessage),
@@ -157,6 +186,8 @@ pub enum ParsedMessage {
     IPOQuotingPeriodUpdate(IPOQuotingPeriodUpdateMessage),
     LULDAuctionCollar(LULDAuctionCollarMessage),
     OperationalHalt(OperationalHaltMessage),
+    AddOrder(AddOrderMessage),
+    AddOrderMPIDAttribution(AddOrderMPIDAttributionMessage),
 }
 
 #[must_use]
@@ -189,6 +220,10 @@ pub fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
         MessageType::OperationalHalt => {
             parse_operational_halt(message).map(ParsedMessage::OperationalHalt)
         }
+        MessageType::AddOrder => parse_add_order(message).map(ParsedMessage::AddOrder),
+        MessageType::AddOrderMPIDAttribution => {
+            parse_add_order_mpid_attribution(message).map(ParsedMessage::AddOrderMPIDAttribution)
+        }
     }
 }
 
@@ -210,6 +245,8 @@ pub const MWCB_STATUS_MESSAGE_LEN: usize = 12;
 pub const IPO_QUOTATION_REQUEST_MESSAGE_LEN: usize = 28;
 pub const LULD_ACTION_MESSAGE_LEN: usize = 35;
 pub const OPERATIONAL_HALT_MESSAGE_LEN: usize = 21;
+pub const ADD_ORDER_MESSAGE_LEN: usize = 36;
+pub const ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN: usize = 40;
 
 #[must_use]
 pub fn parse_system_event(message: &[u8]) -> Option<SystemEventMessage> {
@@ -527,6 +564,86 @@ pub fn parse_operational_halt(message: &[u8]) -> Option<OperationalHaltMessage> 
         stock,
         market_code,
         operational_halt_action,
+    })
+}
+
+#[must_use]
+pub fn parse_add_order(message: &[u8]) -> Option<AddOrderMessage> {
+    if message.len() != ADD_ORDER_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'A' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let buy_sell_indicator = message[19];
+    let shares = u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
+    let stock: [u8; 8] = message[24..32].try_into().ok()?;
+    let price = u32::from_be_bytes([message[32], message[33], message[34], message[35]]);
+
+    Some(AddOrderMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        order_reference_number,
+        buy_sell_indicator,
+        shares,
+        stock,
+        price,
+    })
+}
+
+#[must_use]
+pub fn parse_add_order_mpid_attribution(message: &[u8]) -> Option<AddOrderMPIDAttributionMessage> {
+    if message.len() != ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN {
+        return None;
+    }
+    if message[0] != b'F' {
+        return None;
+    }
+
+    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
+    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
+    let timestamp = read_u48_be(&message[5..11]);
+    let order_reference_number = u64::from_be_bytes([
+        message[11],
+        message[12],
+        message[13],
+        message[14],
+        message[15],
+        message[16],
+        message[17],
+        message[18],
+    ]);
+    let buy_sell_indicator = message[19];
+    let shares = u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
+    let stock: [u8; 8] = message[24..32].try_into().ok()?;
+    let price = u32::from_be_bytes([message[32], message[33], message[34], message[35]]);
+    let attribution: [u8; 4] = message[36..40].try_into().ok()?;
+
+    Some(AddOrderMPIDAttributionMessage {
+        stock_locate,
+        tracking_number,
+        timestamp,
+        order_reference_number,
+        buy_sell_indicator,
+        shares,
+        stock,
+        price,
+        attribution,
     })
 }
 
@@ -1114,8 +1231,9 @@ mod tests {
     fn parse_ipo_quoting_period_update_valid() {
         let timestamp = 0x0102_0304_0506u64;
         let stock = *b"ABCD    ";
-        let bytes =
-            ipo_quoting_period_update_bytes(0x1111, 0x2222, timestamp, stock, 34_200, b'A', 200_000);
+        let bytes = ipo_quoting_period_update_bytes(
+            0x1111, 0x2222, timestamp, stock, 34_200, b'A', 200_000,
+        );
 
         let parsed = parse_ipo_quoting_period_update(&bytes).expect("should parse");
 
@@ -1135,16 +1253,30 @@ mod tests {
 
     #[test]
     fn parse_ipo_quoting_period_update_wrong_type_byte_returns_none() {
-        let mut bytes =
-            ipo_quoting_period_update_bytes(1, 2, 0x0102_0304_0506, *b"ABCD    ", 34_200, b'A', 200_000);
+        let mut bytes = ipo_quoting_period_update_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            *b"ABCD    ",
+            34_200,
+            b'A',
+            200_000,
+        );
         bytes[0] = b'Z';
         assert!(parse_ipo_quoting_period_update(&bytes).is_none());
     }
 
     #[test]
     fn parse_ipo_quoting_period_update_truncated_returns_none() {
-        let mut bytes =
-            ipo_quoting_period_update_bytes(1, 2, 0x0102_0304_0506, *b"ABCD    ", 34_200, b'A', 200_000);
+        let mut bytes = ipo_quoting_period_update_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            *b"ABCD    ",
+            34_200,
+            b'A',
+            200_000,
+        );
         bytes.pop();
         assert!(parse_ipo_quoting_period_update(&bytes).is_none());
     }
@@ -1181,8 +1313,9 @@ mod tests {
         // offset slip between any pair of them.
         let timestamp = 0x0102_0304_0506u64;
         let stock = *b"EFGH    ";
-        let bytes =
-            luld_auction_collar_bytes(0x1111, 0x2222, timestamp, stock, 100_000, 110_000, 90_000, 2);
+        let bytes = luld_auction_collar_bytes(
+            0x1111, 0x2222, timestamp, stock, 100_000, 110_000, 90_000, 2,
+        );
 
         let parsed = parse_luld_action_collar(&bytes).expect("should parse");
 
@@ -1203,16 +1336,32 @@ mod tests {
 
     #[test]
     fn parse_luld_action_collar_wrong_type_byte_returns_none() {
-        let mut bytes =
-            luld_auction_collar_bytes(1, 2, 0x0102_0304_0506, *b"EFGH    ", 100_000, 110_000, 90_000, 2);
+        let mut bytes = luld_auction_collar_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            *b"EFGH    ",
+            100_000,
+            110_000,
+            90_000,
+            2,
+        );
         bytes[0] = b'Z';
         assert!(parse_luld_action_collar(&bytes).is_none());
     }
 
     #[test]
     fn parse_luld_action_collar_truncated_returns_none() {
-        let mut bytes =
-            luld_auction_collar_bytes(1, 2, 0x0102_0304_0506, *b"EFGH    ", 100_000, 110_000, 90_000, 2);
+        let mut bytes = luld_auction_collar_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            *b"EFGH    ",
+            100_000,
+            110_000,
+            90_000,
+            2,
+        );
         bytes.pop();
         assert!(parse_luld_action_collar(&bytes).is_none());
     }
@@ -1272,6 +1421,195 @@ mod tests {
         let mut bytes = operational_halt_bytes(1, 2, 0x0102_0304_0506, *b"IJKL    ", b'Q', b'H');
         bytes.pop();
         assert!(parse_operational_halt(&bytes).is_none());
+    }
+
+    // ---- AddOrderMessage ----
+
+    fn add_order_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        order_reference_number: u64,
+        buy_sell_indicator: u8,
+        shares: u32,
+        stock: [u8; 8],
+        price: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ADD_ORDER_MESSAGE_LEN);
+        buf.push(b'A');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&order_reference_number.to_be_bytes());
+        buf.push(buy_sell_indicator);
+        buf.extend_from_slice(&shares.to_be_bytes());
+        buf.extend_from_slice(&stock);
+        buf.extend_from_slice(&price.to_be_bytes());
+        assert_eq!(buf.len(), ADD_ORDER_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_add_order_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let order_reference_number = 0x1122_3344_5566_7788u64;
+        let stock = *b"NVDA    ";
+        let bytes = add_order_bytes(
+            0x1111,
+            0x2222,
+            timestamp,
+            order_reference_number,
+            b'B',
+            500,
+            stock,
+            1_425_000,
+        );
+
+        let parsed = parse_add_order(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            AddOrderMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                order_reference_number,
+                buy_sell_indicator: b'B',
+                shares: 500,
+                stock,
+                price: 1_425_000,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_add_order_wrong_type_byte_returns_none() {
+        let mut bytes = add_order_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            0x1122_3344_5566_7788,
+            b'B',
+            500,
+            *b"NVDA    ",
+            1_425_000,
+        );
+        bytes[0] = b'Z';
+        assert!(parse_add_order(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_add_order_truncated_returns_none() {
+        let mut bytes = add_order_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            0x1122_3344_5566_7788,
+            b'B',
+            500,
+            *b"NVDA    ",
+            1_425_000,
+        );
+        bytes.pop();
+        assert!(parse_add_order(&bytes).is_none());
+    }
+
+    // ---- AddOrderMPIDAttributionMessage ----
+
+    #[allow(clippy::too_many_arguments)] // test-only builder, mirrors the wire format 1:1
+    fn add_order_mpid_attribution_bytes(
+        stock_locate: u16,
+        tracking_number: u16,
+        timestamp: u64,
+        order_reference_number: u64,
+        buy_sell_indicator: u8,
+        shares: u32,
+        stock: [u8; 8],
+        price: u32,
+        attribution: [u8; 4],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN);
+        buf.push(b'F');
+        buf.extend_from_slice(&stock_locate.to_be_bytes());
+        buf.extend_from_slice(&tracking_number.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf.extend_from_slice(&order_reference_number.to_be_bytes());
+        buf.push(buy_sell_indicator);
+        buf.extend_from_slice(&shares.to_be_bytes());
+        buf.extend_from_slice(&stock);
+        buf.extend_from_slice(&price.to_be_bytes());
+        buf.extend_from_slice(&attribution);
+        assert_eq!(buf.len(), ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN);
+        buf
+    }
+
+    #[test]
+    fn parse_add_order_mpid_attribution_valid() {
+        let timestamp = 0x0102_0304_0506u64;
+        let order_reference_number = 0x1122_3344_5566_7788u64;
+        let stock = *b"AMD     ";
+        let bytes = add_order_mpid_attribution_bytes(
+            0x1111,
+            0x2222,
+            timestamp,
+            order_reference_number,
+            b'S',
+            300,
+            stock,
+            850_000,
+            *b"EDGX",
+        );
+
+        let parsed = parse_add_order_mpid_attribution(&bytes).expect("should parse");
+
+        assert_eq!(
+            parsed,
+            AddOrderMPIDAttributionMessage {
+                stock_locate: 0x1111,
+                tracking_number: 0x2222,
+                timestamp,
+                order_reference_number,
+                buy_sell_indicator: b'S',
+                shares: 300,
+                stock,
+                price: 850_000,
+                attribution: *b"EDGX",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_add_order_mpid_attribution_wrong_type_byte_returns_none() {
+        let mut bytes = add_order_mpid_attribution_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            0x1122_3344_5566_7788,
+            b'S',
+            300,
+            *b"AMD     ",
+            850_000,
+            *b"EDGX",
+        );
+        bytes[0] = b'Z';
+        assert!(parse_add_order_mpid_attribution(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_add_order_mpid_attribution_truncated_returns_none() {
+        let mut bytes = add_order_mpid_attribution_bytes(
+            1,
+            2,
+            0x0102_0304_0506,
+            0x1122_3344_5566_7788,
+            b'S',
+            300,
+            *b"AMD     ",
+            850_000,
+            *b"EDGX",
+        );
+        bytes.pop();
+        assert!(parse_add_order_mpid_attribution(&bytes).is_none());
     }
 }
 // </Generated by Claude.ai>
