@@ -1,6 +1,7 @@
 use crate::source::PacketSource;
 
 pub mod source;
+pub mod itch;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct MoldUDP64PacketHeader {
