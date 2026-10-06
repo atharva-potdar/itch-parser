@@ -1,6 +1,7 @@
 use crate::source::PacketSource;
 
 pub mod itch;
+pub mod orderbook;
 pub mod source;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
