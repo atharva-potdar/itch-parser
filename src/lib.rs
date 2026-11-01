@@ -24,6 +24,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod itch;
+pub mod reference;
 pub mod source;
 
 use std::ops::ControlFlow;

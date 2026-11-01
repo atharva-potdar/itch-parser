@@ -56,6 +56,20 @@ impl Price {
         self.0
     }
 
+    /// Wraps a value that is already in canonical (1e-8) units, for arithmetic
+    /// results such as a spread or a midpoint.
+    #[must_use]
+    pub const fn from_x10_8_canonical(raw: i64) -> Self {
+        Self(raw)
+    }
+
+    /// The point halfway between two prices, rounding towards zero and
+    /// saturating rather than wrapping at the extremes of `i64`.
+    #[must_use]
+    pub const fn midpoint(self, other: Self) -> Self {
+        Self(self.0.midpoint(other.0))
+    }
+
     /// Lossy convenience accessor for display and demo strategies.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -64,11 +78,27 @@ impl Price {
     }
 }
 
+impl std::fmt::Display for Price {
+    /// Prints the canonical value with trailing zeros trimmed, so
+    /// `142.5000` renders as `142.5` and `150` as `150`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.0 < 0 { "-" } else { "" };
+        let magnitude = self.0.unsigned_abs();
+        let whole = magnitude / Self::SCALE.unsigned_abs();
+        let fraction = magnitude % Self::SCALE.unsigned_abs();
+        if fraction == 0 {
+            return write!(f, "{sign}{whole}");
+        }
+        let digits = format!("{fraction:08}");
+        write!(f, "{sign}{whole}.{}", digits.trim_end_matches('0'))
+    }
+}
+
 /// An 8-byte, space-padded, ASCII security symbol.
 ///
 /// Constructed only through [`Symbol::from_bytes`], so the bytes are always
 /// printable ASCII. [`Symbol::as_str`] trims the right padding.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Default)]
 pub struct Symbol([u8; 8]);
 
 impl Symbol {
@@ -326,6 +356,134 @@ byte_enum! {
     }
 }
 
+byte_enum! {
+    /// Nasdaq continued-listing compliance state (`R` messages).
+    ///
+    /// Only meaningful for Nasdaq-listed issues; other venues leave the field
+    /// blank. The combined values spell out *which* deficiencies apply, so
+    /// they are not a bitmask and must not be treated as one.
+    pub enum FinancialStatusIndicator {
+        /// `D` — deficient.
+        Deficient = b'D',
+        /// `E` — delinquent in filing.
+        Delinquent = b'E',
+        /// `Q` — bankrupt.
+        Bankrupt = b'Q',
+        /// `S` — suspended.
+        Suspended = b'S',
+        /// `G` — deficient and bankrupt.
+        DeficientAndBankrupt = b'G',
+        /// `H` — deficient and delinquent.
+        DeficientAndDelinquent = b'H',
+        /// `J` — delinquent and bankrupt.
+        DelinquentAndBankrupt = b'J',
+        /// `K` — deficient, delinquent, and bankrupt.
+        DeficientDelinquentAndBankrupt = b'K',
+        /// `C` — creations and/or redemptions suspended (ETPs only).
+        CreationsSuspended = b'C',
+        /// `N` — normal; no compliance deficiency.
+        Normal = b'N',
+        /// A space — not available (non-Nasdaq-listed issues).
+        NotAvailable = b' ',
+    }
+}
+
+byte_enum! {
+    /// Security class (`R` messages, ITCH Appendix D).
+    ///
+    /// Note the gaps: `D`, `E`, `G`, `H`, `J`, `K`, and `M` are deliberately
+    /// absent because Nasdaq does not define them. They fall through to
+    /// [`IssueClassification::Other`].
+    pub enum IssueClassification {
+        /// `A` — American Depositary Share.
+        AmericanDepositaryShare = b'A',
+        /// `B` — bond.
+        Bond = b'B',
+        /// `C` — common stock.
+        CommonStock = b'C',
+        /// `F` — depository receipt.
+        DepositoryReceipt = b'F',
+        /// `I` — 144A security.
+        Rule144A = b'I',
+        /// `L` — limited partnership.
+        LimitedPartnership = b'L',
+        /// `N` — notes.
+        Notes = b'N',
+        /// `O` — ordinary share.
+        OrdinaryShare = b'O',
+        /// `P` — preferred stock.
+        PreferredStock = b'P',
+        /// `Q` — other securities.
+        OtherSecurities = b'Q',
+        /// `R` — right.
+        Right = b'R',
+        /// `S` — shares of beneficial interest.
+        SharesOfBeneficialInterest = b'S',
+        /// `T` — convertible debenture.
+        ConvertibleDebenture = b'T',
+        /// `U` — unit.
+        Unit = b'U',
+        /// `V` — units/beneficial interest.
+        UnitsBeneficialInterest = b'V',
+        /// `W` — warrant.
+        Warrant = b'W',
+    }
+}
+
+byte_enum! {
+    /// Limit Up/Limit Down price-band tier (`R` messages).
+    pub enum LuldReferencePriceTier {
+        /// `1` — Tier 1 NMS stocks and selected ETPs.
+        Tier1 = b'1',
+        /// `2` — Tier 2 NMS stocks.
+        Tier2 = b'2',
+        /// A space — not available.
+        NotAvailable = b' ',
+    }
+}
+
+byte_enum! {
+    /// A quoting participant's registration status (`L` messages).
+    pub enum MarketMakerMode {
+        /// `N` — normal.
+        Normal = b'N',
+        /// `P` — passive.
+        Passive = b'P',
+        /// `S` — syndicate.
+        Syndicate = b'S',
+        /// `R` — pre-syndicate.
+        PreSyndicate = b'R',
+        /// `L` — penalty.
+        Penalty = b'L',
+    }
+}
+
+byte_enum! {
+    /// A market participant's registration state in an issue (`L` messages).
+    pub enum MarketParticipantState {
+        /// `A` — active.
+        Active = b'A',
+        /// `E` — excused/withdrawn.
+        ExcusedOrWithdrawn = b'E',
+        /// `W` — withdrawn.
+        Withdrawn = b'W',
+        /// `S` — suspended.
+        Suspended = b'S',
+        /// `D` — deleted.
+        Deleted = b'D',
+    }
+}
+
+byte_enum! {
+    /// Whether an `K` message announces or cancels an IPO release.
+    pub enum IpoQuotationReleaseQualifier {
+        /// `A` — anticipated quotation release time.
+        Anticipated = b'A',
+        /// `C` — IPO release canceled/postponed.
+        CanceledOrPostponed = b'C',
+    }
+}
+
 /// Side of a resting order or trade.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum BuySell {
@@ -553,18 +711,18 @@ pub struct StockDirectoryMessage {
     pub timestamp: u64,
     pub stock: Symbol,
     pub market_category: MarketCategory,
-    /// Reference data; decoded at the ingest layer (ITCH Appendix D).
-    pub financial_status_indicator: u8,
+    pub financial_status_indicator: FinancialStatusIndicator,
     pub round_lot_size: u32,
     pub round_lots_only: bool,
-    /// Reference data; decoded at the ingest layer (ITCH Appendix D).
-    pub issue_classification: u8,
+    pub issue_classification: IssueClassification,
+    /// Two ASCII characters. Appendix E defines roughly a hundred codes, most
+    /// of them vendor-specific, so this stays raw rather than becoming an enum
+    /// with a hundred-odd variants that would need updating with the spec.
     pub issue_subtype: [u8; 2],
     pub authenticity: Authenticity,
     pub short_sale_threshold_indicator: bool,
     pub ipo_flag: bool,
-    /// Reference data; decoded at the ingest layer.
-    pub luld_reference_price_tier: u8,
+    pub luld_reference_price_tier: LuldReferencePriceTier,
     pub etp_flag: bool,
     pub etp_leverage_factor: u32,
     pub inverse_indicator: bool,
@@ -598,10 +756,8 @@ pub struct MarketParticipantPositionMessage {
     pub mpid: [u8; 4],
     pub stock: Symbol,
     pub primary_market_maker: bool,
-    /// Reference data; decoded at the ingest layer.
-    pub market_maker_mode: u8,
-    /// Reference data; decoded at the ingest layer.
-    pub market_participant_state: u8,
+    pub market_maker_mode: MarketMakerMode,
+    pub market_participant_state: MarketParticipantState,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -631,8 +787,7 @@ pub struct IPOQuotingPeriodUpdateMessage {
     pub stock: Symbol,
     /// Seconds since midnight.
     pub ipo_quotation_release_time: u32,
-    /// Reference data; decoded at the ingest layer.
-    pub ipo_quotation_release_qualifier: u8,
+    pub ipo_quotation_release_qualifier: IpoQuotationReleaseQualifier,
     pub ipo_price: Price,
 }
 
@@ -1044,15 +1199,15 @@ pub fn parse_stock_directory(message: &[u8]) -> Result<StockDirectoryMessage, Pa
         timestamp: read_u48_be(&message[5..11]),
         stock: read_symbol(message, 11)?,
         market_category: MarketCategory::from_byte(message[19]),
-        financial_status_indicator: message[20],
+        financial_status_indicator: FinancialStatusIndicator::from_byte(message[20]),
         round_lot_size: read_u32(message, 21),
         round_lots_only: read_flag(message, 25),
-        issue_classification: message[26],
+        issue_classification: IssueClassification::from_byte(message[26]),
         issue_subtype: read_array::<2>(message, 27)?,
         authenticity: Authenticity::from_byte(message[29]),
         short_sale_threshold_indicator: read_flag(message, 30),
         ipo_flag: read_flag(message, 31),
-        luld_reference_price_tier: message[32],
+        luld_reference_price_tier: LuldReferencePriceTier::from_byte(message[32]),
         etp_flag: read_flag(message, 33),
         etp_leverage_factor: read_u32(message, 34),
         inverse_indicator: read_flag(message, 38),
@@ -1094,8 +1249,8 @@ pub fn parse_market_participant_position(
         mpid: read_array::<4>(message, 11)?,
         stock: read_symbol(message, 15)?,
         primary_market_maker: read_flag(message, 23),
-        market_maker_mode: message[24],
-        market_participant_state: message[25],
+        market_maker_mode: MarketMakerMode::from_byte(message[24]),
+        market_participant_state: MarketParticipantState::from_byte(message[25]),
     })
 }
 
@@ -1131,7 +1286,7 @@ pub fn parse_ipo_quoting_period_update(
         timestamp: read_u48_be(&message[5..11]),
         stock: read_symbol(message, 11)?,
         ipo_quotation_release_time: read_u32(message, 19),
-        ipo_quotation_release_qualifier: message[23],
+        ipo_quotation_release_qualifier: IpoQuotationReleaseQualifier::from_byte(message[23]),
         ipo_price: read_price4(message, 24),
     })
 }
@@ -1525,6 +1680,32 @@ mod tests {
         check_enum!(RegSHOAction);
         check_enum!(Authenticity);
         check_enum!(BuySell);
+        check_enum!(FinancialStatusIndicator);
+        check_enum!(IssueClassification);
+        check_enum!(LuldReferencePriceTier);
+        check_enum!(MarketMakerMode);
+        check_enum!(MarketParticipantState);
+        check_enum!(IpoQuotationReleaseQualifier);
+
+        // Locked in because these two are easy to swap from memory: the spec
+        // says G = deficient *and bankrupt*, H = deficient *and delinquent*.
+        assert_eq!(
+            FinancialStatusIndicator::from_byte(b'G'),
+            FinancialStatusIndicator::DeficientAndBankrupt
+        );
+        assert_eq!(
+            FinancialStatusIndicator::from_byte(b'H'),
+            FinancialStatusIndicator::DeficientAndDelinquent
+        );
+        // Appendix D really does skip D/E/G/H/J/K/M for issue classification.
+        assert_eq!(
+            IssueClassification::from_byte(b'D'),
+            IssueClassification::Other(b'D')
+        );
+        assert_eq!(
+            IssueClassification::from_byte(b'F'),
+            IssueClassification::DepositoryReceipt
+        );
 
         assert_eq!(EventCode::from_byte(b'C'), EventCode::EndOfMessages);
         assert_eq!(EventCode::from_byte(b'x'), EventCode::Other(b'x'));
@@ -1593,15 +1774,15 @@ mod tests {
             timestamp: TS,
             stock: sym(b"AAPL    "),
             market_category: MarketCategory::GlobalSelect,
-            financial_status_indicator: b'N',
+            financial_status_indicator: FinancialStatusIndicator::Normal,
             round_lot_size: 100,
             round_lots_only: true,
-            issue_classification: b'C',
+            issue_classification: IssueClassification::CommonStock,
             issue_subtype: *b"XY",
             authenticity: Authenticity::Production,
             short_sale_threshold_indicator: false,
             ipo_flag: true,
-            luld_reference_price_tier: b'1',
+            luld_reference_price_tier: LuldReferencePriceTier::Tier1,
             etp_flag: false,
             etp_leverage_factor: 9999,
             inverse_indicator: false,
@@ -1692,7 +1873,7 @@ mod tests {
             buf.extend_from_slice(b"ABCD");
             buf.extend_from_slice(b"GOOG    ");
             buf.push(b'Y');
-            buf.push(b'1');
+            buf.push(b'P');
             buf.push(b'A');
         })
     }
@@ -1707,8 +1888,8 @@ mod tests {
             mpid: *b"ABCD",
             stock: sym(b"GOOG    "),
             primary_market_maker: true,
-            market_maker_mode: b'1',
-            market_participant_state: b'A',
+            market_maker_mode: MarketMakerMode::Passive,
+            market_participant_state: MarketParticipantState::Active,
         };
         assert_eq!(parse_market_participant_position(&bytes), Ok(expected));
         assert_eq!(
@@ -1780,7 +1961,7 @@ mod tests {
             timestamp: TS,
             stock: sym(b"ABCD    "),
             ipo_quotation_release_time: 34_200,
-            ipo_quotation_release_qualifier: b'A',
+            ipo_quotation_release_qualifier: IpoQuotationReleaseQualifier::Anticipated,
             ipo_price: p4(200_000),
         };
         assert_eq!(parse_ipo_quoting_period_update(&bytes), Ok(expected));
