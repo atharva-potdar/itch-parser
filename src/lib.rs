@@ -1,6 +1,6 @@
 //! A decoder for Nasdaq's TotalView-ITCH 5.0 feed, carried over `MoldUDP64`.
 //!
-//! The crate is split into three layers:
+//! The crate is layered so each part can be used without the ones above it:
 //!
 //! * [`source`] — transports ([`PacketSource`](source::PacketSource)) and feed
 //!   adapters ([`FeedSource`](source::FeedSource)) that turn bytes into a stream
@@ -8,6 +8,10 @@
 //! * [`Session`] — `MoldUDP64` sequencing: session tracking, gap detection, and
 //!   stale/duplicate rejection.
 //! * [`itch`] — pure, allocation-free decoding of every ITCH 5.0 message type.
+//! * [`reference`] — a `stock_locate` ⇄ symbol registry built from `R` messages.
+//! * [`book`] — a per-locate limit order book rebuilt from order events.
+//! * [`alpha`] — a small order-flow imbalance strategy, as a worked example.
+//! * [`gateway`] — a paper-trading gateway with risk checks and P&L.
 //!
 //! # Integrity model
 //!
