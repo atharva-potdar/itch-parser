@@ -25,6 +25,7 @@
 
 pub mod alpha;
 pub mod book;
+pub mod gateway;
 pub mod itch;
 pub mod reference;
 pub mod source;
