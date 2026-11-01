@@ -990,6 +990,41 @@ pub enum ParsedMessage {
     DLCRPriceDiscovery(DLCRPriceDiscoveryMessage),
 }
 
+impl ParsedMessage {
+    /// The message's ITCH timestamp, in nanoseconds since midnight.
+    ///
+    /// Every message type carries one, so this is a convenient way to drive
+    /// time-dependent consumers without matching all 23 variants.
+    #[must_use]
+    pub const fn timestamp(self) -> u64 {
+        match self {
+            Self::SystemEvent(message) => message.timestamp,
+            Self::StockDirectory(message) => message.timestamp,
+            Self::StockTradingAction(message) => message.timestamp,
+            Self::RegSHORestriction(message) => message.timestamp,
+            Self::MarketParticipantPosition(message) => message.timestamp,
+            Self::MWCBDeclineLevel(message) => message.timestamp,
+            Self::MWCBStatus(message) => message.timestamp,
+            Self::IPOQuotingPeriodUpdate(message) => message.timestamp,
+            Self::LULDAuctionCollar(message) => message.timestamp,
+            Self::OperationalHalt(message) => message.timestamp,
+            Self::AddOrder(message) => message.timestamp,
+            Self::AddOrderMPIDAttribution(message) => message.timestamp,
+            Self::OrderExecuted(message) => message.timestamp,
+            Self::OrderExecutedPrice(message) => message.timestamp,
+            Self::OrderCancel(message) => message.timestamp,
+            Self::OrderDelete(message) => message.timestamp,
+            Self::OrderReplace(message) => message.timestamp,
+            Self::Trade(message) => message.timestamp,
+            Self::CrossTrade(message) => message.timestamp,
+            Self::BrokenTrade(message) => message.timestamp,
+            Self::NOII(message) => message.timestamp,
+            Self::RPII(message) => message.timestamp,
+            Self::DLCRPriceDiscovery(message) => message.timestamp,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lengths
 // ---------------------------------------------------------------------------

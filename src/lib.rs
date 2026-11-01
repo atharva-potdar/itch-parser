@@ -23,6 +23,7 @@
 // The README is compiled as part of the crate docs so its examples cannot rot.
 #![doc = include_str!("../README.md")]
 
+pub mod alpha;
 pub mod book;
 pub mod itch;
 pub mod reference;
