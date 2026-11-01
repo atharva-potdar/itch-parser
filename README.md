@@ -138,7 +138,3 @@ integration suites:
 
 Drop a real capture into `tests/data/` (see the README there) to additionally
 run a full-file conformance pass.
-
-## License
-
-MIT OR Apache-2.0

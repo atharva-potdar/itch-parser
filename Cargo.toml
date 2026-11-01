@@ -3,11 +3,7 @@ name = "itch-parser"
 version = "0.4.0"
 edition = "2024"
 description = "Allocation-free Nasdaq TotalView-ITCH 5.0 decoder over MoldUDP64"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/atharva-potdar/itch-parser"
 readme = "README.md"
-keywords = ["nasdaq", "itch", "market-data", "moldudp64", "trading"]
-categories = ["parser-implementations", "finance"]
 
 [dependencies]
 # Only the benchmark binary uses a custom global allocator; gating it keeps
