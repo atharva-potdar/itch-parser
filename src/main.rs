@@ -1,8 +1,9 @@
-use itch_parser::itch::parse_message;
-use itch_parser::source::{FilePacketSource, write_packets_to_file};
-use itch_parser::{Session, build_end_of_session_packet, build_packet, run_pipeline};
+use itch_parser::itch::{EventCode, ParsedMessage, parse_message};
+use itch_parser::source::{FeedEvent, FilePacketSource, MoldUdp64Source, write_packets_to_file};
+use itch_parser::{build_end_of_session_packet, build_packet, run_feed};
+use std::ops::ControlFlow;
 
-/// Hand-builds a minimal, real System Event message
+/// Hand-builds a minimal, real System Event message.
 fn system_event_message_bytes(
     stock_locate: u16,
     tracking_number: u16,
@@ -20,7 +21,8 @@ fn system_event_message_bytes(
 
 fn main() -> std::io::Result<()> {
     let session_id = *b"SESSION001";
-    let system_event = system_event_message_bytes(1, 1, 34_200_000_000_000, b'O'); // 'O' = Start of Messages
+    // 'O' = Start of Messages.
+    let system_event = system_event_message_bytes(1, 1, 34_200_000_000_000, b'O');
 
     let demo_packets = vec![
         build_packet(session_id, 1, &[system_event.as_slice()]),
@@ -33,30 +35,39 @@ fn main() -> std::io::Result<()> {
     let fixture_path = std::env::temp_dir().join("moldudp64_demo.bin");
     write_packets_to_file(&fixture_path, &demo_packets)?;
 
-    let source = FilePacketSource::open(&fixture_path)?;
-    let mut session = Session::new();
-    let mut unparsed_count = 0usize;
+    let source = MoldUdp64Source::new(FilePacketSource::open(&fixture_path)?);
 
-    run_pipeline(
+    let mut unparsed = 0usize;
+
+    let stats = run_feed(
         source,
-        &mut session,
-        |header, status| {
-            println!(
-                "seq={} count={} -> {status:?}",
-                header.sequence_number, header.message_count
-            );
+        |event| {
+            println!("{event:?}");
+            // Under the default `GapPolicy::Halt` nothing past a gap is
+            // delivered, so the stream stays trustworthy without any special
+            // handling here.
+            match event {
+                FeedEvent::EndOfSession => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
         },
-        |message| {
-            if let Some(parsed) = parse_message(message) {
-                println!("  {parsed:?}");
-            } else {
-                unparsed_count += 1;
-                eprintln!("  unparseable ITCH message: {message:02x?}");
+        |message| match parse_message(message) {
+            Ok(ParsedMessage::SystemEvent(event)) => {
+                println!("  system event: {event:?}");
+                if event.event_code == EventCode::EndOfMessages {
+                    println!("  (end of messages)");
+                }
+            }
+            Ok(other) => println!("  {other:?}"),
+            Err(error) => {
+                unparsed += 1;
+                eprintln!("  unparseable ITCH message: {error:?} {message:02x?}");
             }
         },
     )?;
 
-    println!("unparsed messages: {unparsed_count}");
+    println!("stats: {stats:?}");
+    println!("unparsed messages: {unparsed}");
 
     std::fs::remove_file(&fixture_path)?;
     Ok(())
