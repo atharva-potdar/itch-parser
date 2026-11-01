@@ -1,15 +1,31 @@
 [package]
 name = "itch-parser"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+description = "Allocation-free Nasdaq TotalView-ITCH 5.0 decoder over MoldUDP64"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/atharva-potdar/itch-parser"
+readme = "README.md"
+keywords = ["nasdaq", "itch", "market-data", "moldudp64", "trading"]
+categories = ["parser-implementations", "finance"]
 
 [dependencies]
-mimalloc = "0.1.52"
+# Only the benchmark binary uses a custom global allocator; gating it keeps
+# `mimalloc` and its `cc` build dependency out of every library consumer.
+mimalloc = { version = "0.1.52", optional = true }
+
+[features]
+default = []
+bench-alloc = ["dep:mimalloc"]
 
 [lints.clippy]
 all = "warn"
 nursery = "warn"
 pedantic = "warn"
+
+[[bin]]
+name = "bench"
+required-features = ["bench-alloc"]
 
 [profile.release]
 opt-level = 3

@@ -1,1 +1,6 @@
 /target
+
+# Licensed, large real-capture fixtures; see tests/data/README.md
+/tests/data/*.ITCH50
+/tests/data/*.itch
+/tests/data/*.gz

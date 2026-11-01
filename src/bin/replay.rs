@@ -1,4 +1,4 @@
-use itch_parser::source::{FilePacketSource, PacketSource};
+use itch_parser::source::{FilePacketSource, LengthPrefix, PacketSource};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 
@@ -20,18 +20,22 @@ fn main() -> std::io::Result<()> {
         .unwrap_or("12345")
         .parse()
         .expect("invalid port");
+    let prefix = match args.next().as_deref() {
+        Some("u16") => LengthPrefix::U16,
+        Some("u32") | None => LengthPrefix::U32,
+        Some(other) => panic!("unknown length prefix {other:?}; expected u16 or u32"),
+    };
 
     let target = SocketAddrV4::new(multicast_addr, port);
 
-    // Ephemeral local port
+    // Ephemeral local port.
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
 
-    // Necessary specifically for local loopback testing
+    // Necessary specifically for local loopback testing.
     socket.set_multicast_loop_v4(true)?;
 
-    let mut source = FilePacketSource::open(&fixture_path)?;
+    let mut source = FilePacketSource::open_with_prefix(&fixture_path, prefix)?;
     let mut sent = 0usize;
-
     let mut buf = Vec::new();
 
     while let Some(received) = source.next_packet(&mut buf)? {

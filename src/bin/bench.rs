@@ -57,11 +57,15 @@ fn bench_hot_path(buffer: &[u8], ranges: &[(usize, usize)]) {
             continue;
         };
         let status = session.on_packet(&header);
-        if matches!(status, PacketStatus::InOrder | PacketStatus::Gap { .. }) {
-            parse_messages(body, header.message_count, |msg| {
+        if matches!(
+            status,
+            PacketStatus::InOrder | PacketStatus::NewSession { .. }
+        ) {
+            let outcome = parse_messages(body, header.message_count, |msg| {
                 black_box(msg);
                 messages_seen += 1;
             });
+            black_box(outcome);
         }
     }
     let elapsed = start.elapsed();

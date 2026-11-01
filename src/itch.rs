@@ -1,3 +1,366 @@
+//! Nasdaq TotalView-ITCH 5.0 message decoding.
+//!
+//! This module is a pure byte-to-struct transform: it never allocates, never
+//! performs I/O, and never panics on untrusted input. Every parser validates
+//! the message type byte and the exact message length **before** touching any
+//! field offset, so all indexing below is in-bounds by construction. The
+//! `every_type_rejects_every_wrong_length` test enforces that invariant for
+//! every known type across every length from 0 to 60 bytes.
+//!
+//! Two numeric conventions apply across the whole protocol:
+//!
+//! * **Timestamps** are 6-byte big-endian counts of nanoseconds since
+//!   midnight, widened into a `u64`. The single exception is
+//!   [`DLCRPriceDiscoveryMessage::near_execution_time`], which is a full
+//!   8-byte field.
+//! * **Prices** are fixed-point. Most are `Price (4)` (units of 1e-4); the
+//!   market-wide circuit breaker levels in [`MWCBDeclineLevelMessage`] are
+//!   `Price (8)` (units of 1e-8). Both are normalised into [`Price`], which
+//!   stores 1e-8 units, so mixed-scale comparisons are impossible.
+#![allow(clippy::missing_errors_doc)]
+
+// ---------------------------------------------------------------------------
+// Primitive value types
+// ---------------------------------------------------------------------------
+
+/// A price normalised to 1e-8 units.
+///
+/// ITCH mixes two wire scales: `Price (4)` for essentially everything, and
+/// `Price (8)` for the MWCB decline levels. Storing both in one canonical
+/// scale means downstream code cannot accidentally add a 1e-4 value to a
+/// 1e-8 value and be silently wrong by four orders of magnitude.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+pub struct Price(i64);
+
+impl Price {
+    /// Number of canonical units in one whole currency unit.
+    pub const SCALE: i64 = 100_000_000;
+
+    /// A `Price (4)` wire value: infallible, since `u32::MAX` scaled by 1e4
+    /// is far below `i64::MAX`.
+    #[must_use]
+    pub fn from_x10_4(raw: u32) -> Self {
+        Self(i64::from(raw) * 10_000)
+    }
+
+    /// A `Price (8)` wire value. Returns `None` when the value does not fit
+    /// in an `i64`, which is reachable on the wire but not in practice.
+    #[must_use]
+    pub fn from_x10_8(raw: u64) -> Option<Self> {
+        i64::try_from(raw).ok().map(Self)
+    }
+
+    /// The canonical (1e-8) representation.
+    #[must_use]
+    pub const fn as_x10_8(self) -> i64 {
+        self.0
+    }
+
+    /// Lossy convenience accessor for display and demo strategies.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64 / Self::SCALE as f64
+    }
+}
+
+/// An 8-byte, space-padded, ASCII security symbol.
+///
+/// Constructed only through [`Symbol::from_bytes`], so the bytes are always
+/// printable ASCII. [`Symbol::as_str`] trims the right padding.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+pub struct Symbol([u8; 8]);
+
+impl Symbol {
+    /// Validates that every byte is printable ASCII or a space.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 8]) -> Option<Self> {
+        bytes
+            .iter()
+            .all(|&b| b.is_ascii_graphic() || b == b' ')
+            .then_some(Self(bytes))
+    }
+
+    /// The raw, space-padded bytes exactly as they appeared on the wire.
+    #[must_use]
+    pub const fn raw(self) -> [u8; 8] {
+        self.0
+    }
+
+    /// The symbol with right padding removed. Always valid UTF-8 because the
+    /// constructor restricted the bytes to 7-bit ASCII.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        let end = self.0.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+        // SAFETY-equivalent argument: `from_bytes` proves ASCII, so this
+        // cannot fail; falling back to "" keeps the function panic-free.
+        std::str::from_utf8(&self.0[..end]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Display for Symbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Indicator enums
+// ---------------------------------------------------------------------------
+
+/// Declares a single-byte indicator enum with an `Other(u8)` catch-all.
+///
+/// The catch-all is deliberate: Nasdaq has added values to these fields over
+/// time (for example `M` = NYSE Texas in market category), and an unrecognised
+/// indicator must never cost the caller an otherwise-valid message.
+macro_rules! byte_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident = $byte:literal ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )*
+            /// A value not defined by ITCH 5.0, preserved verbatim.
+            Other(u8),
+        }
+
+        impl $name {
+            #[must_use]
+            pub const fn from_byte(b: u8) -> Self {
+                match b {
+                    $( $byte => Self::$variant, )*
+                    other => Self::Other(other),
+                }
+            }
+
+            #[must_use]
+            pub const fn as_byte(self) -> u8 {
+                match self {
+                    $( Self::$variant => $byte, )*
+                    Self::Other(b) => b,
+                }
+            }
+        }
+    };
+}
+
+byte_enum! {
+    /// `S`ystem Event codes.
+    pub enum EventCode {
+        /// `O` — start of messages, before any other message of the day.
+        StartOfMessages = b'O',
+        /// `S` — start of system hours.
+        StartOfSystemHours = b'S',
+        /// `Q` — start of market hours.
+        StartOfMarketHours = b'Q',
+        /// `M` — end of market hours.
+        EndOfMarketHours = b'M',
+        /// `E` — end of system hours.
+        EndOfSystemHours = b'E',
+        /// `C` — end of messages, the last message of the day.
+        EndOfMessages = b'C',
+    }
+}
+
+byte_enum! {
+    /// Listing market or tier of an instrument (`R` messages).
+    pub enum MarketCategory {
+        /// `Q` — Nasdaq Global Select Market.
+        GlobalSelect = b'Q',
+        /// `G` — Nasdaq Global Market.
+        GlobalMarket = b'G',
+        /// `S` — Nasdaq Capital Market.
+        CapitalMarket = b'S',
+        /// `N` — New York Stock Exchange.
+        Nyse = b'N',
+        /// `A` — NYSE American.
+        NyseAmerican = b'A',
+        /// `P` — NYSE Arca.
+        NyseArca = b'P',
+        /// `M` — NYSE Texas.
+        NyseTexas = b'M',
+        /// `Z` — BATS Z Exchange.
+        BatsZ = b'Z',
+        /// `V` — Investors' Exchange.
+        Iex = b'V',
+        /// A space — not available.
+        NotAvailable = b' ',
+    }
+}
+
+byte_enum! {
+    /// Current trading state of a security (`H` messages).
+    pub enum TradingState {
+        /// `H` — halted across all U.S. equity markets.
+        Halted = b'H',
+        /// `P` — paused across all U.S. equity markets (Nasdaq-listed only).
+        Paused = b'P',
+        /// `Q` — quotation-only period during a cross-SRO halt or pause.
+        QuotationOnly = b'Q',
+        /// `T` — trading on Nasdaq.
+        Trading = b'T',
+    }
+}
+
+byte_enum! {
+    /// Operational halt action (`h` messages).
+    pub enum HaltAction {
+        /// `H` — operationally halted on the identified market.
+        Halted = b'H',
+        /// `T` — halt lifted, trading resumed.
+        Resumed = b'T',
+    }
+}
+
+byte_enum! {
+    /// Market center a `h` message refers to.
+    pub enum MarketCode {
+        /// `Q` — Nasdaq.
+        Nasdaq = b'Q',
+        /// `B` — Nasdaq BX.
+        NasdaqBx = b'B',
+        /// `X` — Nasdaq PSX.
+        NasdaqPsx = b'X',
+    }
+}
+
+byte_enum! {
+    /// Which cross an execution belongs to (`Q`, `I` messages).
+    pub enum CrossType {
+        /// `O` — opening cross.
+        Opening = b'O',
+        /// `C` — closing cross.
+        Closing = b'C',
+        /// `H` — cross for IPO and halted/paused securities.
+        IpoOrHalt = b'H',
+        /// `I` — intraday cross.
+        Intraday = b'I',
+    }
+}
+
+byte_enum! {
+    /// Side of an imbalance (`I` messages).
+    pub enum ImbalanceDirection {
+        /// `B` — buy imbalance.
+        Buy = b'B',
+        /// `S` — sell imbalance.
+        Sell = b'S',
+        /// `N` — no imbalance.
+        None = b'N',
+        /// `O` — insufficient orders to calculate.
+        InsufficientOrders = b'O',
+    }
+}
+
+byte_enum! {
+    /// Deviation of the near price from the current reference price.
+    pub enum PriceVariationIndicator {
+        /// `L` — less than 1%.
+        LessThanOnePercent = b'L',
+        /// `N` — between 1% and 2%.
+        OneToTwoPercent = b'N',
+        /// `O` — 2% or more.
+        TwoPercentOrMore = b'O',
+        /// A space — not applicable.
+        NotApplicable = b' ',
+    }
+}
+
+byte_enum! {
+    /// Market-wide circuit breaker level breached (`W` messages).
+    pub enum BreachedLevel {
+        /// `1` — level 1.
+        Level1 = b'1',
+        /// `2` — level 2.
+        Level2 = b'2',
+        /// `3` — level 3.
+        Level3 = b'3',
+    }
+}
+
+byte_enum! {
+    /// Whether a DLCR security may be released for trading (`O` messages).
+    pub enum OpenEligibilityStatus {
+        /// `N` — not eligible.
+        NotEligible = b'N',
+        /// `Y` — eligible.
+        Eligible = b'Y',
+    }
+}
+
+byte_enum! {
+    /// Retail interest side (`N` messages).
+    pub enum InterestFlag {
+        /// `B` — retail interest on the bid.
+        Bid = b'B',
+        /// `A` — retail interest on the ask.
+        Ask = b'A',
+        /// `N` — no retail interest.
+        None = b'N',
+    }
+}
+
+byte_enum! {
+    /// Reg SHO short sale price test action (`Y` messages).
+    pub enum RegSHOAction {
+        /// `0` — no price test in place.
+        None = b'0',
+        /// `1` — restriction in effect due to an intraday price drop.
+        IntradayRestriction = b'1',
+        /// `2` — restriction remains in effect.
+        RestrictionRemains = b'2',
+    }
+}
+
+byte_enum! {
+    /// Whether a `R` message came from the production or test feed.
+    pub enum Authenticity {
+        /// `P` — live/production.
+        Production = b'P',
+        /// `T` — test.
+        Test = b'T',
+    }
+}
+
+/// Side of a resting order or trade.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub enum BuySell {
+    /// `B` — buy.
+    Buy,
+    /// `S` — sell.
+    Sell,
+    /// A value not defined by ITCH 5.0, preserved verbatim.
+    Other(u8),
+}
+
+impl BuySell {
+    #[must_use]
+    pub const fn from_byte(b: u8) -> Self {
+        match b {
+            b'B' => Self::Buy,
+            b'S' => Self::Sell,
+            other => Self::Other(other),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Buy => b'B',
+            Self::Sell => b'S',
+            Self::Other(b) => b,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message type tags
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MessageType {
     SystemEvent,               // 'S'
@@ -26,6 +389,33 @@ pub enum MessageType {
 }
 
 impl MessageType {
+    /// Every type byte defined by ITCH 5.0.
+    pub const ALL: [Self; 23] = [
+        Self::SystemEvent,
+        Self::StockDirectory,
+        Self::StockTradingAction,
+        Self::RegSHORestriction,
+        Self::MarketParticipantPosition,
+        Self::MWCBDeclineLevel,
+        Self::MWCBStatus,
+        Self::IPOQuotingPeriodUpdate,
+        Self::LULDAuctionCollar,
+        Self::OperationalHalt,
+        Self::AddOrder,
+        Self::AddOrderMPIDAttribution,
+        Self::OrderExecuted,
+        Self::OrderExecutedPrice,
+        Self::OrderCancel,
+        Self::OrderDelete,
+        Self::OrderReplace,
+        Self::Trade,
+        Self::CrossTrade,
+        Self::BrokenTrade,
+        Self::NOII,
+        Self::RPII,
+        Self::DLCRPriceDiscovery,
+    ];
+
     #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
@@ -55,37 +445,129 @@ impl MessageType {
             _ => None,
         }
     }
+
+    /// The exact on-wire length of this message type. ITCH 5.0 messages are
+    /// all fixed-length.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::SystemEvent => b'S',
+            Self::StockDirectory => b'R',
+            Self::StockTradingAction => b'H',
+            Self::RegSHORestriction => b'Y',
+            Self::MarketParticipantPosition => b'L',
+            Self::MWCBDeclineLevel => b'V',
+            Self::MWCBStatus => b'W',
+            Self::IPOQuotingPeriodUpdate => b'K',
+            Self::LULDAuctionCollar => b'J',
+            Self::OperationalHalt => b'h',
+            Self::AddOrder => b'A',
+            Self::AddOrderMPIDAttribution => b'F',
+            Self::OrderExecuted => b'E',
+            Self::OrderExecutedPrice => b'C',
+            Self::OrderCancel => b'X',
+            Self::OrderDelete => b'D',
+            Self::OrderReplace => b'U',
+            Self::Trade => b'P',
+            Self::CrossTrade => b'Q',
+            Self::BrokenTrade => b'B',
+            Self::NOII => b'I',
+            Self::RPII => b'N',
+            Self::DLCRPriceDiscovery => b'O',
+        }
+    }
+
+    #[must_use]
+    pub const fn message_len(self) -> usize {
+        match self {
+            Self::SystemEvent => SYSTEM_EVENT_MESSAGE_LEN,
+            Self::StockDirectory => STOCK_DIRECTORY_MESSAGE_LEN,
+            Self::StockTradingAction => STOCK_TRADING_ACTION_MESSAGE_LEN,
+            Self::RegSHORestriction => REG_SHO_RESTRICTION_MESSAGE_LEN,
+            Self::MarketParticipantPosition => MARKET_PARTICIPANT_MESSAGE_LEN,
+            Self::MWCBDeclineLevel => MWCB_DECLINE_LEVEL_MESSAGE_LEN,
+            Self::MWCBStatus => MWCB_STATUS_MESSAGE_LEN,
+            Self::IPOQuotingPeriodUpdate => IPO_QUOTATION_REQUEST_MESSAGE_LEN,
+            Self::LULDAuctionCollar => LULD_ACTION_MESSAGE_LEN,
+            Self::OperationalHalt => OPERATIONAL_HALT_MESSAGE_LEN,
+            Self::AddOrder => ADD_ORDER_MESSAGE_LEN,
+            Self::AddOrderMPIDAttribution => ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN,
+            Self::OrderExecuted => ORDER_EXECUTED_MESSAGE_LEN,
+            Self::OrderExecutedPrice => ORDER_EXECUTED_PRICE_MESSAGE_LEN,
+            Self::OrderCancel => ORDER_CANCEL_MESSAGE_LEN,
+            Self::OrderDelete => ORDER_DELETE_MESSAGE_LEN,
+            Self::OrderReplace => ORDER_REPLACE_MESSAGE_LEN,
+            Self::Trade => TRADE_MESSAGE_LEN,
+            Self::CrossTrade => CROSS_TRADE_MESSAGE_LEN,
+            Self::BrokenTrade => BROKEN_TRADE_MESSAGE_LEN,
+            Self::NOII => NOII_MESSAGE_LEN,
+            Self::RPII => RPII_MESSAGE_LEN,
+            Self::DLCRPriceDiscovery => DLCR_PRICE_DISCOVERY_MESSAGE_LEN,
+        }
+    }
 }
 
-// all timestamps are u48, nanoseconds since midnight
-// all price fields are fixed-point, x10^4 of actual price
+// ---------------------------------------------------------------------------
+// Parse errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ParseError {
+    /// The type byte does not name any ITCH 5.0 message.
+    UnknownType(u8),
+    /// A type-specific parser was handed a message of a different type.
+    WrongType { expected: u8, actual: u8 },
+    /// The message length does not match the fixed length for its type.
+    WrongLength { expected: usize, actual: usize },
+    /// An 8-byte symbol field contained bytes that are not printable ASCII.
+    InvalidSymbol,
+    /// A wire value did not fit the canonical representation.
+    ValueOutOfRange,
+}
+
+// ---------------------------------------------------------------------------
+// Message payloads
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct SystemEventMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub event_code: u8,
+    pub event_code: EventCode,
+}
+
+impl SystemEventMessage {
+    /// True for the final message of the trading day (`C`).
+    #[must_use]
+    pub const fn is_end_of_messages(&self) -> bool {
+        matches!(self.event_code, EventCode::EndOfMessages)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // mirrors the wire format 1:1
 pub struct StockDirectoryMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub market_category: u8,
+    pub stock: Symbol,
+    pub market_category: MarketCategory,
+    /// Reference data; decoded at the ingest layer (ITCH Appendix D).
     pub financial_status_indicator: u8,
     pub round_lot_size: u32,
-    pub round_lots_only: u8,
+    pub round_lots_only: bool,
+    /// Reference data; decoded at the ingest layer (ITCH Appendix D).
     pub issue_classification: u8,
     pub issue_subtype: [u8; 2],
-    pub authenticity: u8,
-    pub short_sale_threshold_indicator: u8,
-    pub ipo_flag: u8,
+    pub authenticity: Authenticity,
+    pub short_sale_threshold_indicator: bool,
+    pub ipo_flag: bool,
+    /// Reference data; decoded at the ingest layer.
     pub luld_reference_price_tier: u8,
-    pub etp_flag: u8,
+    pub etp_flag: bool,
     pub etp_leverage_factor: u32,
-    pub inverse_indicator: u8,
+    pub inverse_indicator: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -93,8 +575,8 @@ pub struct StockTradingActionMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub trading_state: u8,
+    pub stock: Symbol,
+    pub trading_state: TradingState,
     pub reserved: u8,
     pub reason: [u8; 4],
 }
@@ -104,8 +586,8 @@ pub struct RegSHORestrictionMessage {
     pub locate_code: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub reg_sho_action: u8,
+    pub stock: Symbol,
+    pub reg_sho_action: RegSHOAction,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -114,9 +596,11 @@ pub struct MarketParticipantPositionMessage {
     pub tracking_number: u16,
     pub timestamp: u64,
     pub mpid: [u8; 4],
-    pub stock: [u8; 8],
-    pub primary_market_maker: u8,
+    pub stock: Symbol,
+    pub primary_market_maker: bool,
+    /// Reference data; decoded at the ingest layer.
     pub market_maker_mode: u8,
+    /// Reference data; decoded at the ingest layer.
     pub market_participant_state: u8,
 }
 
@@ -125,9 +609,10 @@ pub struct MWCBDeclineLevelMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub level1: u64,
-    pub level2: u64,
-    pub level3: u64,
+    // These three are the only `Price (8)` fields in the protocol.
+    pub level1: Price,
+    pub level2: Price,
+    pub level3: Price,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -135,7 +620,7 @@ pub struct MWCBStatusMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub breached_level: u8,
+    pub breached_level: BreachedLevel,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -143,10 +628,12 @@ pub struct IPOQuotingPeriodUpdateMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub ipo_quotation_release_time: u32, // seconds since midnight
+    pub stock: Symbol,
+    /// Seconds since midnight.
+    pub ipo_quotation_release_time: u32,
+    /// Reference data; decoded at the ingest layer.
     pub ipo_quotation_release_qualifier: u8,
-    pub ipo_price: u32,
+    pub ipo_price: Price,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -154,10 +641,10 @@ pub struct LULDAuctionCollarMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub auction_collar_reference_price: u32,
-    pub upper_auction_collar_price: u32,
-    pub lower_auction_collar_price: u32,
+    pub stock: Symbol,
+    pub auction_collar_reference_price: Price,
+    pub upper_auction_collar_price: Price,
+    pub lower_auction_collar_price: Price,
     pub auction_collar_extension: u32,
 }
 
@@ -166,9 +653,9 @@ pub struct OperationalHaltMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub market_code: u8,
-    pub operational_halt_action: u8,
+    pub stock: Symbol,
+    pub market_code: MarketCode,
+    pub operational_halt_action: HaltAction,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -177,10 +664,10 @@ pub struct AddOrderMessage {
     pub tracking_number: u16,
     pub timestamp: u64,
     pub order_reference_number: u64,
-    pub buy_sell_indicator: u8,
+    pub buy_sell_indicator: BuySell,
     pub shares: u32,
-    pub stock: [u8; 8],
-    pub price: u32,
+    pub stock: Symbol,
+    pub price: Price,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -189,10 +676,10 @@ pub struct AddOrderMPIDAttributionMessage {
     pub tracking_number: u16,
     pub timestamp: u64,
     pub order_reference_number: u64,
-    pub buy_sell_indicator: u8,
+    pub buy_sell_indicator: BuySell,
     pub shares: u32,
-    pub stock: [u8; 8],
-    pub price: u32,
+    pub stock: Symbol,
+    pub price: Price,
     pub attribution: [u8; 4],
 }
 
@@ -214,8 +701,8 @@ pub struct OrderExecutedPriceMessage {
     pub order_reference_number: u64,
     pub executed_shares: u32,
     pub match_number: u64,
-    pub printable: u8,
-    pub execution_price: u32,
+    pub printable: bool,
+    pub execution_price: Price,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -243,7 +730,7 @@ pub struct OrderReplaceMessage {
     pub original_order_reference_number: u64,
     pub new_order_reference_number: u64,
     pub shares: u32,
-    pub price: u32,
+    pub price: Price,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -252,10 +739,10 @@ pub struct TradeMessage {
     pub tracking_number: u16,
     pub timestamp: u64,
     pub order_reference_number: u64,
-    pub buy_sell_indicator: u8,
+    pub buy_sell_indicator: BuySell,
     pub shares: u32,
-    pub stock: [u8; 8],
-    pub price: u32,
+    pub stock: Symbol,
+    pub price: Price,
     pub match_number: u64,
 }
 
@@ -265,10 +752,10 @@ pub struct CrossTradeMessage {
     pub tracking_number: u16,
     pub timestamp: u64,
     pub shares: u64,
-    pub stock: [u8; 8],
-    pub cross_price: u32,
+    pub stock: Symbol,
+    pub cross_price: Price,
     pub match_number: u64,
-    pub cross_type: u8,
+    pub cross_type: CrossType,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -286,13 +773,13 @@ pub struct NOIIMessage {
     pub timestamp: u64,
     pub paired_shares: u64,
     pub imbalance_shares: u64,
-    pub imbalance_direction: u8,
-    pub stock: [u8; 8],
-    pub far_price: u32,
-    pub near_price: u32,
-    pub current_reference_price: u32,
-    pub cross_type: u8,
-    pub price_variation_indicator: u8,
+    pub imbalance_direction: ImbalanceDirection,
+    pub stock: Symbol,
+    pub far_price: Price,
+    pub near_price: Price,
+    pub current_reference_price: Price,
+    pub cross_type: CrossType,
+    pub price_variation_indicator: PriceVariationIndicator,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -300,8 +787,8 @@ pub struct RPIIMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub interest_flag: u8,
+    pub stock: Symbol,
+    pub interest_flag: InterestFlag,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -309,14 +796,16 @@ pub struct DLCRPriceDiscoveryMessage {
     pub stock_locate: u16,
     pub tracking_number: u16,
     pub timestamp: u64,
-    pub stock: [u8; 8],
-    pub open_eligibility_status: u8,
-    pub minimum_allowable_price: u32,
-    pub maximum_allowable_price: u32,
-    pub near_execution_price: u32,
-    pub near_execution_time: u64, // nanoseconds since midnight
-    pub lower_price_range_collar: u32,
-    pub upper_price_range_collar: u32,
+    pub stock: Symbol,
+    pub open_eligibility_status: OpenEligibilityStatus,
+    pub minimum_allowable_price: Price,
+    pub maximum_allowable_price: Price,
+    pub near_execution_price: Price,
+    /// Nanoseconds since midnight. Unusually, this field is a full 8 bytes
+    /// rather than the 6-byte timestamp used everywhere else.
+    pub near_execution_time: u64,
+    pub lower_price_range_collar: Price,
+    pub upper_price_range_collar: Price,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -346,10 +835,143 @@ pub enum ParsedMessage {
     DLCRPriceDiscovery(DLCRPriceDiscoveryMessage),
 }
 
-#[must_use]
-pub fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
-    let type_byte = *message.first()?;
-    match MessageType::from_byte(type_byte)? {
+// ---------------------------------------------------------------------------
+// Lengths
+// ---------------------------------------------------------------------------
+
+pub const SYSTEM_EVENT_MESSAGE_LEN: usize = 12;
+pub const STOCK_DIRECTORY_MESSAGE_LEN: usize = 39;
+pub const STOCK_TRADING_ACTION_MESSAGE_LEN: usize = 25;
+pub const REG_SHO_RESTRICTION_MESSAGE_LEN: usize = 20;
+pub const MARKET_PARTICIPANT_MESSAGE_LEN: usize = 26;
+pub const MWCB_DECLINE_LEVEL_MESSAGE_LEN: usize = 35;
+pub const MWCB_STATUS_MESSAGE_LEN: usize = 12;
+pub const IPO_QUOTATION_REQUEST_MESSAGE_LEN: usize = 28;
+pub const LULD_ACTION_MESSAGE_LEN: usize = 35;
+pub const OPERATIONAL_HALT_MESSAGE_LEN: usize = 21;
+pub const ADD_ORDER_MESSAGE_LEN: usize = 36;
+pub const ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN: usize = 40;
+pub const ORDER_EXECUTED_MESSAGE_LEN: usize = 31;
+pub const ORDER_EXECUTED_PRICE_MESSAGE_LEN: usize = 36;
+pub const ORDER_CANCEL_MESSAGE_LEN: usize = 23;
+pub const ORDER_DELETE_MESSAGE_LEN: usize = 19;
+pub const ORDER_REPLACE_MESSAGE_LEN: usize = 35;
+pub const TRADE_MESSAGE_LEN: usize = 44;
+pub const CROSS_TRADE_MESSAGE_LEN: usize = 40;
+pub const BROKEN_TRADE_MESSAGE_LEN: usize = 19;
+pub const NOII_MESSAGE_LEN: usize = 50;
+pub const RPII_MESSAGE_LEN: usize = 20;
+pub const DLCR_PRICE_DISCOVERY_MESSAGE_LEN: usize = 48;
+
+// ---------------------------------------------------------------------------
+// Field readers
+//
+// Every reader assumes the enclosing parser has already validated `message.len()`
+// against the exact wire length. That is enforced by the `length_sweep` test.
+// ---------------------------------------------------------------------------
+
+/// Reads a 6-byte big-endian value (ITCH's on-wire timestamp width) and
+/// widens it into a `u64`.
+fn read_u48_be(bytes: &[u8]) -> u64 {
+    let mut widened = [0u8; 8];
+    widened[2..8].copy_from_slice(bytes);
+    u64::from_be_bytes(widened)
+}
+
+const fn read_u16(message: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([message[off], message[off + 1]])
+}
+
+const fn read_u32(message: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([
+        message[off],
+        message[off + 1],
+        message[off + 2],
+        message[off + 3],
+    ])
+}
+
+const fn read_u64(message: &[u8], off: usize) -> u64 {
+    u64::from_be_bytes([
+        message[off],
+        message[off + 1],
+        message[off + 2],
+        message[off + 3],
+        message[off + 4],
+        message[off + 5],
+        message[off + 6],
+        message[off + 7],
+    ])
+}
+
+fn read_array<const N: usize>(message: &[u8], off: usize) -> Result<[u8; N], ParseError> {
+    message
+        .get(off..off + N)
+        .and_then(|slice| <[u8; N]>::try_from(slice).ok())
+        .ok_or(ParseError::WrongLength {
+            expected: off + N,
+            actual: message.len(),
+        })
+}
+
+fn read_symbol(message: &[u8], off: usize) -> Result<Symbol, ParseError> {
+    Symbol::from_bytes(read_array::<8>(message, off)?).ok_or(ParseError::InvalidSymbol)
+}
+
+/// A `Price (4)` field.
+fn read_price4(message: &[u8], off: usize) -> Price {
+    Price::from_x10_4(read_u32(message, off))
+}
+
+/// A `Price (8)` field, of which the protocol defines exactly three.
+fn read_price8(message: &[u8], off: usize) -> Result<Price, ParseError> {
+    Price::from_x10_8(read_u64(message, off)).ok_or(ParseError::ValueOutOfRange)
+}
+
+/// Reads a `Y`/`N` field, mapping anything else to `false`.
+const fn read_flag(message: &[u8], off: usize) -> bool {
+    message[off] == b'Y'
+}
+
+/// Validates type byte and exact length. Must be the first statement of every
+/// type-specific parser.
+macro_rules! check {
+    ($message:expr, $type_byte:literal, $len:expr) => {
+        if $message.len() != $len {
+            return Err(ParseError::WrongLength {
+                expected: $len,
+                actual: $message.len(),
+            });
+        }
+        if $message[0] != $type_byte {
+            return Err(ParseError::WrongType {
+                expected: $type_byte,
+                actual: $message[0],
+            });
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+/// Parses a single ITCH 5.0 message.
+///
+/// Unlike the previous `Option`-returning API, this distinguishes "I do not
+/// know this type" from "I know this type and the message is malformed", which
+/// is what a feed handler needs in order to report loss accurately.
+pub fn parse_message(message: &[u8]) -> Result<ParsedMessage, ParseError> {
+    let Some(&type_byte) = message.first() else {
+        return Err(ParseError::WrongLength {
+            expected: 1,
+            actual: 0,
+        });
+    };
+    let Some(message_type) = MessageType::from_byte(type_byte) else {
+        return Err(ParseError::UnknownType(type_byte));
+    };
+    match message_type {
         MessageType::SystemEvent => parse_system_event(message).map(ParsedMessage::SystemEvent),
         MessageType::StockDirectory => {
             parse_stock_directory(message).map(ParsedMessage::StockDirectory)
@@ -400,2742 +1022,1196 @@ pub fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
     }
 }
 
-/// Reads a 6-byte big-endian value (ITCH's on-wire timestamp width) and
-/// widens it into a `u64`. `bytes` must be exactly 6 bytes long.
-fn read_u48_be(bytes: &[u8]) -> u64 {
-    let mut widened = [0u8; 8];
-    widened[2..8].copy_from_slice(bytes);
-    u64::from_be_bytes(widened)
-}
+// ---------------------------------------------------------------------------
+// Individual parsers
+// ---------------------------------------------------------------------------
 
-pub const SYSTEM_EVENT_MESSAGE_LEN: usize = 12;
-pub const STOCK_DIRECTORY_MESSAGE_LEN: usize = 39;
-pub const STOCK_TRADING_ACTION_MESSAGE_LEN: usize = 25;
-pub const REG_SHO_RESTRICTION_MESSAGE_LEN: usize = 20;
-pub const MARKET_PARTICIPANT_MESSAGE_LEN: usize = 26;
-pub const MWCB_DECLINE_LEVEL_MESSAGE_LEN: usize = 35;
-pub const MWCB_STATUS_MESSAGE_LEN: usize = 12;
-pub const IPO_QUOTATION_REQUEST_MESSAGE_LEN: usize = 28;
-pub const LULD_ACTION_MESSAGE_LEN: usize = 35;
-pub const OPERATIONAL_HALT_MESSAGE_LEN: usize = 21;
-pub const ADD_ORDER_MESSAGE_LEN: usize = 36;
-pub const ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN: usize = 40;
-pub const ORDER_EXECUTED_MESSAGE_LEN: usize = 31;
-pub const ORDER_EXECUTED_PRICE_MESSAGE_LEN: usize = 36;
-pub const ORDER_CANCEL_MESSAGE_LEN: usize = 23;
-pub const ORDER_DELETE_MESSAGE_LEN: usize = 19;
-pub const ORDER_REPLACE_MESSAGE_LEN: usize = 35;
-pub const TRADE_MESSAGE_LEN: usize = 44;
-pub const CROSS_TRADE_MESSAGE_LEN: usize = 40;
-pub const BROKEN_TRADE_MESSAGE_LEN: usize = 19;
-pub const NOII_MESSAGE_LEN: usize = 50;
-pub const RPII_MESSAGE_LEN: usize = 20;
-pub const DLCR_PRICE_DISCOVERY_MESSAGE_LEN: usize = 48;
-
-#[must_use]
-pub fn parse_system_event(message: &[u8]) -> Option<SystemEventMessage> {
-    if message.len() != SYSTEM_EVENT_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'S' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let event_code = message[11];
-
-    Some(SystemEventMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        event_code,
+pub fn parse_system_event(message: &[u8]) -> Result<SystemEventMessage, ParseError> {
+    check!(message, b'S', SYSTEM_EVENT_MESSAGE_LEN);
+    Ok(SystemEventMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        event_code: EventCode::from_byte(message[11]),
     })
 }
 
-#[must_use]
-pub fn parse_stock_directory(message: &[u8]) -> Option<StockDirectoryMessage> {
-    if message.len() != STOCK_DIRECTORY_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'R' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let market_category = message[19];
-    let financial_status_indicator = message[20];
-    let round_lot_size = u32::from_be_bytes([message[21], message[22], message[23], message[24]]);
-    let round_lots_only = message[25];
-    let issue_classification = message[26];
-    let issue_subtype: [u8; 2] = message[27..29].try_into().ok()?;
-    let authenticity = message[29];
-    let short_sale_threshold_indicator = message[30];
-    let ipo_flag = message[31];
-    let luld_reference_price_tier = message[32];
-    let etp_flag = message[33];
-    let etp_leverage_factor =
-        u32::from_be_bytes([message[34], message[35], message[36], message[37]]);
-    let inverse_indicator = message[38];
-
-    Some(StockDirectoryMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        market_category,
-        financial_status_indicator,
-        round_lot_size,
-        round_lots_only,
-        issue_classification,
-        issue_subtype,
-        authenticity,
-        short_sale_threshold_indicator,
-        ipo_flag,
-        luld_reference_price_tier,
-        etp_flag,
-        etp_leverage_factor,
-        inverse_indicator,
+pub fn parse_stock_directory(message: &[u8]) -> Result<StockDirectoryMessage, ParseError> {
+    check!(message, b'R', STOCK_DIRECTORY_MESSAGE_LEN);
+    Ok(StockDirectoryMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        market_category: MarketCategory::from_byte(message[19]),
+        financial_status_indicator: message[20],
+        round_lot_size: read_u32(message, 21),
+        round_lots_only: read_flag(message, 25),
+        issue_classification: message[26],
+        issue_subtype: read_array::<2>(message, 27)?,
+        authenticity: Authenticity::from_byte(message[29]),
+        short_sale_threshold_indicator: read_flag(message, 30),
+        ipo_flag: read_flag(message, 31),
+        luld_reference_price_tier: message[32],
+        etp_flag: read_flag(message, 33),
+        etp_leverage_factor: read_u32(message, 34),
+        inverse_indicator: read_flag(message, 38),
     })
 }
 
-#[must_use]
-pub fn parse_stock_trading_action(message: &[u8]) -> Option<StockTradingActionMessage> {
-    if message.len() != STOCK_TRADING_ACTION_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'H' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let trading_state: u8 = message[19];
-    let reserved = message[20];
-    let reason = message[21..25].try_into().ok()?;
-
-    Some(StockTradingActionMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        trading_state,
-        reserved,
-        reason,
+pub fn parse_stock_trading_action(message: &[u8]) -> Result<StockTradingActionMessage, ParseError> {
+    check!(message, b'H', STOCK_TRADING_ACTION_MESSAGE_LEN);
+    Ok(StockTradingActionMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        trading_state: TradingState::from_byte(message[19]),
+        reserved: message[20],
+        reason: read_array::<4>(message, 21)?,
     })
 }
 
-#[must_use]
-pub fn parse_reg_sho_restriction(message: &[u8]) -> Option<RegSHORestrictionMessage> {
-    if message.len() != REG_SHO_RESTRICTION_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'Y' {
-        return None;
-    }
-
-    let locate_code = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let reg_sho_action = message[19];
-
-    Some(RegSHORestrictionMessage {
-        locate_code,
-        tracking_number,
-        timestamp,
-        stock,
-        reg_sho_action,
+pub fn parse_reg_sho_restriction(message: &[u8]) -> Result<RegSHORestrictionMessage, ParseError> {
+    check!(message, b'Y', REG_SHO_RESTRICTION_MESSAGE_LEN);
+    Ok(RegSHORestrictionMessage {
+        locate_code: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        reg_sho_action: RegSHOAction::from_byte(message[19]),
     })
 }
 
-#[must_use]
 pub fn parse_market_participant_position(
     message: &[u8],
-) -> Option<MarketParticipantPositionMessage> {
-    if message.len() != MARKET_PARTICIPANT_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'L' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let mpid: [u8; 4] = message[11..15].try_into().ok()?;
-    let stock: [u8; 8] = message[15..23].try_into().ok()?;
-    let primary_market_maker = message[23];
-    let market_maker_mode = message[24];
-    let market_participant_state = message[25];
-
-    Some(MarketParticipantPositionMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        mpid,
-        stock,
-        primary_market_maker,
-        market_maker_mode,
-        market_participant_state,
+) -> Result<MarketParticipantPositionMessage, ParseError> {
+    check!(message, b'L', MARKET_PARTICIPANT_MESSAGE_LEN);
+    Ok(MarketParticipantPositionMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        mpid: read_array::<4>(message, 11)?,
+        stock: read_symbol(message, 15)?,
+        primary_market_maker: read_flag(message, 23),
+        market_maker_mode: message[24],
+        market_participant_state: message[25],
     })
 }
 
-#[must_use]
-pub fn parse_mwcb_decline_level(message: &[u8]) -> Option<MWCBDeclineLevelMessage> {
-    if message.len() != MWCB_DECLINE_LEVEL_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'V' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let level1 = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let level2 = u64::from_be_bytes([
-        message[19],
-        message[20],
-        message[21],
-        message[22],
-        message[23],
-        message[24],
-        message[25],
-        message[26],
-    ]);
-    let level3 = u64::from_be_bytes([
-        message[27],
-        message[28],
-        message[29],
-        message[30],
-        message[31],
-        message[32],
-        message[33],
-        message[34],
-    ]);
-
-    Some(MWCBDeclineLevelMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        level1,
-        level2,
-        level3,
+pub fn parse_mwcb_decline_level(message: &[u8]) -> Result<MWCBDeclineLevelMessage, ParseError> {
+    check!(message, b'V', MWCB_DECLINE_LEVEL_MESSAGE_LEN);
+    Ok(MWCBDeclineLevelMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        level1: read_price8(message, 11)?,
+        level2: read_price8(message, 19)?,
+        level3: read_price8(message, 27)?,
     })
 }
 
-#[must_use]
-pub fn parse_mwcb_status(message: &[u8]) -> Option<MWCBStatusMessage> {
-    if message.len() != MWCB_STATUS_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'W' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let breached_level = message[11];
-
-    Some(MWCBStatusMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        breached_level,
+pub fn parse_mwcb_status(message: &[u8]) -> Result<MWCBStatusMessage, ParseError> {
+    check!(message, b'W', MWCB_STATUS_MESSAGE_LEN);
+    Ok(MWCBStatusMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        breached_level: BreachedLevel::from_byte(message[11]),
     })
 }
 
-#[must_use]
-pub fn parse_ipo_quoting_period_update(message: &[u8]) -> Option<IPOQuotingPeriodUpdateMessage> {
-    if message.len() != IPO_QUOTATION_REQUEST_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'K' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let ipo_quotation_release_time =
-        u32::from_be_bytes([message[19], message[20], message[21], message[22]]);
-    let ipo_quotation_release_qualifier = message[23];
-    let ipo_price = u32::from_be_bytes([message[24], message[25], message[26], message[27]]);
-
-    Some(IPOQuotingPeriodUpdateMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        ipo_quotation_release_time,
-        ipo_quotation_release_qualifier,
-        ipo_price,
+pub fn parse_ipo_quoting_period_update(
+    message: &[u8],
+) -> Result<IPOQuotingPeriodUpdateMessage, ParseError> {
+    check!(message, b'K', IPO_QUOTATION_REQUEST_MESSAGE_LEN);
+    Ok(IPOQuotingPeriodUpdateMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        ipo_quotation_release_time: read_u32(message, 19),
+        ipo_quotation_release_qualifier: message[23],
+        ipo_price: read_price4(message, 24),
     })
 }
 
-#[must_use]
-pub fn parse_luld_action_collar(message: &[u8]) -> Option<LULDAuctionCollarMessage> {
-    if message.len() != LULD_ACTION_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'J' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let auction_collar_reference_price =
-        u32::from_be_bytes([message[19], message[20], message[21], message[22]]);
-    let upper_auction_collar_price =
-        u32::from_be_bytes([message[23], message[24], message[25], message[26]]);
-    let lower_auction_collar_price =
-        u32::from_be_bytes([message[27], message[28], message[29], message[30]]);
-    let auction_collar_extension =
-        u32::from_be_bytes([message[31], message[32], message[33], message[34]]);
-
-    Some(LULDAuctionCollarMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        auction_collar_reference_price,
-        upper_auction_collar_price,
-        lower_auction_collar_price,
-        auction_collar_extension,
+pub fn parse_luld_action_collar(message: &[u8]) -> Result<LULDAuctionCollarMessage, ParseError> {
+    check!(message, b'J', LULD_ACTION_MESSAGE_LEN);
+    Ok(LULDAuctionCollarMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        auction_collar_reference_price: read_price4(message, 19),
+        upper_auction_collar_price: read_price4(message, 23),
+        lower_auction_collar_price: read_price4(message, 27),
+        auction_collar_extension: read_u32(message, 31),
     })
 }
 
-#[must_use]
-pub fn parse_operational_halt(message: &[u8]) -> Option<OperationalHaltMessage> {
-    if message.len() != OPERATIONAL_HALT_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'h' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let market_code = message[19];
-    let operational_halt_action = message[20];
-
-    Some(OperationalHaltMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        market_code,
-        operational_halt_action,
+pub fn parse_operational_halt(message: &[u8]) -> Result<OperationalHaltMessage, ParseError> {
+    check!(message, b'h', OPERATIONAL_HALT_MESSAGE_LEN);
+    Ok(OperationalHaltMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        market_code: MarketCode::from_byte(message[19]),
+        operational_halt_action: HaltAction::from_byte(message[20]),
     })
 }
 
-#[must_use]
-pub fn parse_add_order(message: &[u8]) -> Option<AddOrderMessage> {
-    if message.len() != ADD_ORDER_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'A' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let buy_sell_indicator = message[19];
-    let shares = u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
-    let stock: [u8; 8] = message[24..32].try_into().ok()?;
-    let price = u32::from_be_bytes([message[32], message[33], message[34], message[35]]);
-
-    Some(AddOrderMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
-        buy_sell_indicator,
-        shares,
-        stock,
-        price,
+pub fn parse_add_order(message: &[u8]) -> Result<AddOrderMessage, ParseError> {
+    check!(message, b'A', ADD_ORDER_MESSAGE_LEN);
+    Ok(AddOrderMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
+        buy_sell_indicator: BuySell::from_byte(message[19]),
+        shares: read_u32(message, 20),
+        stock: read_symbol(message, 24)?,
+        price: read_price4(message, 32),
     })
 }
 
-#[must_use]
-pub fn parse_add_order_mpid_attribution(message: &[u8]) -> Option<AddOrderMPIDAttributionMessage> {
-    if message.len() != ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'F' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let buy_sell_indicator = message[19];
-    let shares = u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
-    let stock: [u8; 8] = message[24..32].try_into().ok()?;
-    let price = u32::from_be_bytes([message[32], message[33], message[34], message[35]]);
-    let attribution: [u8; 4] = message[36..40].try_into().ok()?;
-
-    Some(AddOrderMPIDAttributionMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
-        buy_sell_indicator,
-        shares,
-        stock,
-        price,
-        attribution,
+pub fn parse_add_order_mpid_attribution(
+    message: &[u8],
+) -> Result<AddOrderMPIDAttributionMessage, ParseError> {
+    check!(message, b'F', ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN);
+    Ok(AddOrderMPIDAttributionMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
+        buy_sell_indicator: BuySell::from_byte(message[19]),
+        shares: read_u32(message, 20),
+        stock: read_symbol(message, 24)?,
+        price: read_price4(message, 32),
+        attribution: read_array::<4>(message, 36)?,
     })
 }
 
-#[must_use]
-pub fn parse_order_executed(message: &[u8]) -> Option<OrderExecutedMessage> {
-    if message.len() != ORDER_EXECUTED_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'E' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let executed_shares = u32::from_be_bytes([message[19], message[20], message[21], message[22]]);
-    let match_number = u64::from_be_bytes([
-        message[23],
-        message[24],
-        message[25],
-        message[26],
-        message[27],
-        message[28],
-        message[29],
-        message[30],
-    ]);
-
-    Some(OrderExecutedMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
-        executed_shares,
-        match_number,
+pub fn parse_order_executed(message: &[u8]) -> Result<OrderExecutedMessage, ParseError> {
+    check!(message, b'E', ORDER_EXECUTED_MESSAGE_LEN);
+    Ok(OrderExecutedMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
+        executed_shares: read_u32(message, 19),
+        match_number: read_u64(message, 23),
     })
 }
 
-#[must_use]
-pub fn parse_order_executed_price(message: &[u8]) -> Option<OrderExecutedPriceMessage> {
-    if message.len() != ORDER_EXECUTED_PRICE_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'C' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let executed_shares = u32::from_be_bytes([message[19], message[20], message[21], message[22]]);
-    let match_number = u64::from_be_bytes([
-        message[23],
-        message[24],
-        message[25],
-        message[26],
-        message[27],
-        message[28],
-        message[29],
-        message[30],
-    ]);
-    let printable = message[31];
-    let execution_price = u32::from_be_bytes([message[32], message[33], message[34], message[35]]);
-
-    Some(OrderExecutedPriceMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
-        executed_shares,
-        match_number,
-        printable,
-        execution_price,
+pub fn parse_order_executed_price(message: &[u8]) -> Result<OrderExecutedPriceMessage, ParseError> {
+    check!(message, b'C', ORDER_EXECUTED_PRICE_MESSAGE_LEN);
+    Ok(OrderExecutedPriceMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
+        executed_shares: read_u32(message, 19),
+        match_number: read_u64(message, 23),
+        printable: read_flag(message, 31),
+        execution_price: read_price4(message, 32),
     })
 }
 
-#[must_use]
-pub fn parse_order_cancel(message: &[u8]) -> Option<OrderCancelMessage> {
-    if message.len() != ORDER_CANCEL_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'X' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let cancelled_shares = u32::from_be_bytes([message[19], message[20], message[21], message[22]]);
-
-    Some(OrderCancelMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
-        cancelled_shares,
+pub fn parse_order_cancel(message: &[u8]) -> Result<OrderCancelMessage, ParseError> {
+    check!(message, b'X', ORDER_CANCEL_MESSAGE_LEN);
+    Ok(OrderCancelMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
+        cancelled_shares: read_u32(message, 19),
     })
 }
 
-#[must_use]
-pub fn parse_order_delete(message: &[u8]) -> Option<OrderDeleteMessage> {
-    if message.len() != ORDER_DELETE_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'D' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-
-    Some(OrderDeleteMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
+pub fn parse_order_delete(message: &[u8]) -> Result<OrderDeleteMessage, ParseError> {
+    check!(message, b'D', ORDER_DELETE_MESSAGE_LEN);
+    Ok(OrderDeleteMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
     })
 }
 
-#[must_use]
-pub fn parse_order_replace(message: &[u8]) -> Option<OrderReplaceMessage> {
-    if message.len() != ORDER_REPLACE_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'U' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let original_order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let new_order_reference_number = u64::from_be_bytes([
-        message[19],
-        message[20],
-        message[21],
-        message[22],
-        message[23],
-        message[24],
-        message[25],
-        message[26],
-    ]);
-    let shares = u32::from_be_bytes([message[27], message[28], message[29], message[30]]);
-    let price = u32::from_be_bytes([message[31], message[32], message[33], message[34]]);
-
-    Some(OrderReplaceMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        original_order_reference_number,
-        new_order_reference_number,
-        shares,
-        price,
+pub fn parse_order_replace(message: &[u8]) -> Result<OrderReplaceMessage, ParseError> {
+    check!(message, b'U', ORDER_REPLACE_MESSAGE_LEN);
+    Ok(OrderReplaceMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        original_order_reference_number: read_u64(message, 11),
+        new_order_reference_number: read_u64(message, 19),
+        shares: read_u32(message, 27),
+        price: read_price4(message, 31),
     })
 }
 
-#[must_use]
-pub fn parse_trade(message: &[u8]) -> Option<TradeMessage> {
-    if message.len() != TRADE_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'P' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let order_reference_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let buy_sell_indicator = message[19];
-    let shares = u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
-    let stock: [u8; 8] = message[24..32].try_into().ok()?;
-    let price = u32::from_be_bytes([message[32], message[33], message[34], message[35]]);
-    let match_number = u64::from_be_bytes([
-        message[36],
-        message[37],
-        message[38],
-        message[39],
-        message[40],
-        message[41],
-        message[42],
-        message[43],
-    ]);
-
-    Some(TradeMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        order_reference_number,
-        buy_sell_indicator,
-        shares,
-        stock,
-        price,
-        match_number,
+pub fn parse_trade(message: &[u8]) -> Result<TradeMessage, ParseError> {
+    check!(message, b'P', TRADE_MESSAGE_LEN);
+    Ok(TradeMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        order_reference_number: read_u64(message, 11),
+        buy_sell_indicator: BuySell::from_byte(message[19]),
+        shares: read_u32(message, 20),
+        stock: read_symbol(message, 24)?,
+        price: read_price4(message, 32),
+        match_number: read_u64(message, 36),
     })
 }
 
-#[must_use]
-pub fn parse_cross_trade(message: &[u8]) -> Option<CrossTradeMessage> {
-    if message.len() != CROSS_TRADE_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'Q' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let shares = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let stock: [u8; 8] = message[19..27].try_into().ok()?;
-    let cross_price = u32::from_be_bytes([message[27], message[28], message[29], message[30]]);
-    let match_number = u64::from_be_bytes([
-        message[31],
-        message[32],
-        message[33],
-        message[34],
-        message[35],
-        message[36],
-        message[37],
-        message[38],
-    ]);
-    let cross_type = message[39];
-
-    Some(CrossTradeMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        shares,
-        stock,
-        cross_price,
-        match_number,
-        cross_type,
+pub fn parse_cross_trade(message: &[u8]) -> Result<CrossTradeMessage, ParseError> {
+    check!(message, b'Q', CROSS_TRADE_MESSAGE_LEN);
+    Ok(CrossTradeMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        shares: read_u64(message, 11),
+        stock: read_symbol(message, 19)?,
+        cross_price: read_price4(message, 27),
+        match_number: read_u64(message, 31),
+        cross_type: CrossType::from_byte(message[39]),
     })
 }
 
-#[must_use]
-pub fn parse_broken_trade(message: &[u8]) -> Option<BrokenTradeMessage> {
-    if message.len() != BROKEN_TRADE_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'B' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let match_number = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-
-    Some(BrokenTradeMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        match_number,
+pub fn parse_broken_trade(message: &[u8]) -> Result<BrokenTradeMessage, ParseError> {
+    check!(message, b'B', BROKEN_TRADE_MESSAGE_LEN);
+    Ok(BrokenTradeMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        match_number: read_u64(message, 11),
     })
 }
 
-#[must_use]
-pub fn parse_noii(message: &[u8]) -> Option<NOIIMessage> {
-    if message.len() != NOII_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'I' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let paired_shares = u64::from_be_bytes([
-        message[11],
-        message[12],
-        message[13],
-        message[14],
-        message[15],
-        message[16],
-        message[17],
-        message[18],
-    ]);
-    let imbalance_shares = u64::from_be_bytes([
-        message[19],
-        message[20],
-        message[21],
-        message[22],
-        message[23],
-        message[24],
-        message[25],
-        message[26],
-    ]);
-    let imbalance_direction = message[27];
-    let stock: [u8; 8] = message[28..36].try_into().ok()?;
-    let far_price = u32::from_be_bytes([message[36], message[37], message[38], message[39]]);
-    let near_price = u32::from_be_bytes([message[40], message[41], message[42], message[43]]);
-    let current_reference_price =
-        u32::from_be_bytes([message[44], message[45], message[46], message[47]]);
-    let cross_type = message[48];
-    let price_variation_indicator = message[49];
-
-    Some(NOIIMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        paired_shares,
-        imbalance_shares,
-        imbalance_direction,
-        stock,
-        far_price,
-        near_price,
-        current_reference_price,
-        cross_type,
-        price_variation_indicator,
+pub fn parse_noii(message: &[u8]) -> Result<NOIIMessage, ParseError> {
+    check!(message, b'I', NOII_MESSAGE_LEN);
+    Ok(NOIIMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        paired_shares: read_u64(message, 11),
+        imbalance_shares: read_u64(message, 19),
+        imbalance_direction: ImbalanceDirection::from_byte(message[27]),
+        stock: read_symbol(message, 28)?,
+        far_price: read_price4(message, 36),
+        near_price: read_price4(message, 40),
+        current_reference_price: read_price4(message, 44),
+        cross_type: CrossType::from_byte(message[48]),
+        price_variation_indicator: PriceVariationIndicator::from_byte(message[49]),
     })
 }
 
-#[must_use]
-pub fn parse_rpii(message: &[u8]) -> Option<RPIIMessage> {
-    if message.len() != RPII_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'N' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let interest_flag = message[19];
-
-    Some(RPIIMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        interest_flag,
+pub fn parse_rpii(message: &[u8]) -> Result<RPIIMessage, ParseError> {
+    check!(message, b'N', RPII_MESSAGE_LEN);
+    Ok(RPIIMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        interest_flag: InterestFlag::from_byte(message[19]),
     })
 }
 
-#[must_use]
-pub fn parse_dlcr_price_discovery(message: &[u8]) -> Option<DLCRPriceDiscoveryMessage> {
-    if message.len() != DLCR_PRICE_DISCOVERY_MESSAGE_LEN {
-        return None;
-    }
-    if message[0] != b'O' {
-        return None;
-    }
-
-    let stock_locate = u16::from_be_bytes([message[1], message[2]]);
-    let tracking_number = u16::from_be_bytes([message[3], message[4]]);
-    let timestamp = read_u48_be(&message[5..11]);
-    let stock: [u8; 8] = message[11..19].try_into().ok()?;
-    let open_eligibility_status = message[19];
-    let minimum_allowable_price =
-        u32::from_be_bytes([message[20], message[21], message[22], message[23]]);
-    let maximum_allowable_price =
-        u32::from_be_bytes([message[24], message[25], message[26], message[27]]);
-    let near_execution_price =
-        u32::from_be_bytes([message[28], message[29], message[30], message[31]]);
-    let near_execution_time = u64::from_be_bytes([
-        message[32],
-        message[33],
-        message[34],
-        message[35],
-        message[36],
-        message[37],
-        message[38],
-        message[39],
-    ]);
-    let lower_price_range_collar =
-        u32::from_be_bytes([message[40], message[41], message[42], message[43]]);
-    let upper_price_range_collar =
-        u32::from_be_bytes([message[44], message[45], message[46], message[47]]);
-
-    Some(DLCRPriceDiscoveryMessage {
-        stock_locate,
-        tracking_number,
-        timestamp,
-        stock,
-        open_eligibility_status,
-        minimum_allowable_price,
-        maximum_allowable_price,
-        near_execution_price,
-        near_execution_time,
-        lower_price_range_collar,
-        upper_price_range_collar,
+pub fn parse_dlcr_price_discovery(message: &[u8]) -> Result<DLCRPriceDiscoveryMessage, ParseError> {
+    check!(message, b'O', DLCR_PRICE_DISCOVERY_MESSAGE_LEN);
+    Ok(DLCRPriceDiscoveryMessage {
+        stock_locate: read_u16(message, 1),
+        tracking_number: read_u16(message, 3),
+        timestamp: read_u48_be(&message[5..11]),
+        stock: read_symbol(message, 11)?,
+        open_eligibility_status: OpenEligibilityStatus::from_byte(message[19]),
+        minimum_allowable_price: read_price4(message, 20),
+        maximum_allowable_price: read_price4(message, 24),
+        near_execution_price: read_price4(message, 28),
+        near_execution_time: read_u64(message, 32),
+        lower_price_range_collar: read_price4(message, 40),
+        upper_price_range_collar: read_price4(message, 44),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 // <Generated by Claude.ai>
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- SystemEventMessage ----
+    const TS: u64 = 0x0102_0304_0506;
 
-    fn system_event_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        event_code: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(SYSTEM_EVENT_MESSAGE_LEN);
-        buf.push(b'S');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]); // low 6 bytes only
-        buf.push(event_code);
-        assert_eq!(buf.len(), SYSTEM_EVENT_MESSAGE_LEN);
+    #[allow(clippy::trivially_copy_pass_by_ref)] // keeps call sites terse
+    fn sym(s: &[u8; 8]) -> Symbol {
+        Symbol::from_bytes(*s).expect("test symbol should be valid ASCII")
+    }
+
+    fn p4(v: u32) -> Price {
+        Price::from_x10_4(v)
+    }
+
+    fn p8(v: u64) -> Price {
+        Price::from_x10_8(v).expect("test price should fit i64")
+    }
+
+    /// Builds a message, asserting the builder emitted the exact wire length.
+    fn build(type_byte: u8, len: usize, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(len);
+        buf.push(type_byte);
+        body(&mut buf);
+        assert_eq!(buf.len(), len, "test builder produced the wrong length");
         buf
     }
 
-    #[test]
-    fn parse_system_event_valid() {
-        // Distinct, non-zero bytes in every position of the timestamp,
-        // specifically so the 6-byte-to-u64 widening is actually exercised.
-        let timestamp = 0x0102_0304_0506u64;
-        let bytes = system_event_bytes(0x1234, 0x5678, timestamp, b'O');
+    fn push_header(buf: &mut Vec<u8>, locate: u16, tracking: u16, timestamp: u64) {
+        buf.extend_from_slice(&locate.to_be_bytes());
+        buf.extend_from_slice(&tracking.to_be_bytes());
+        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
+    }
 
-        let parsed = parse_system_event(&bytes).expect("should parse");
-
+    /// Asserts the three failure modes every parser shares: wrong type byte,
+    /// one byte short, one byte long.
+    fn assert_rejects<T: std::fmt::Debug + PartialEq>(
+        parse: impl Fn(&[u8]) -> Result<T, ParseError>,
+        bytes: &[u8],
+    ) {
+        let type_byte = bytes[0];
         assert_eq!(
-            parsed,
-            SystemEventMessage {
-                stock_locate: 0x1234,
-                tracking_number: 0x5678,
-                timestamp,
-                event_code: b'O',
-            }
+            parse(&bytes[..bytes.len() - 1]),
+            Err(ParseError::WrongLength {
+                expected: bytes.len(),
+                actual: bytes.len() - 1,
+            }),
+            "one byte short must be rejected"
+        );
+        let mut longer = bytes.to_vec();
+        longer.push(0);
+        assert_eq!(
+            parse(&longer),
+            Err(ParseError::WrongLength {
+                expected: bytes.len(),
+                actual: bytes.len() + 1,
+            }),
+            "one byte long must be rejected"
+        );
+        let mut wrong_type = bytes.to_vec();
+        wrong_type[0] = b'Z';
+        assert_eq!(
+            parse(&wrong_type),
+            Err(ParseError::WrongType {
+                expected: type_byte,
+                actual: b'Z',
+            }),
+            "wrong type byte must be rejected"
+        );
+    }
+
+    // ---- Price / Symbol ----
+
+    #[test]
+    fn price_scales_are_normalised_to_1e_8() {
+        assert_eq!(p4(1_425_000).as_x10_8(), 14_250_000_000);
+        assert_eq!(p8(14_250_000_000).as_x10_8(), 14_250_000_000);
+        assert_eq!(p4(1_425_000), p8(14_250_000_000));
+        assert_eq!(p4(0), Price::default());
+        assert!((p4(12_345).as_f64() - 1.2345).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn price_from_x10_8_rejects_values_above_i64_max() {
+        assert_eq!(Price::from_x10_8(u64::MAX), None);
+        assert_eq!(Price::from_x10_8(i64::MAX as u64), Some(Price(i64::MAX)));
+    }
+
+    #[test]
+    fn symbol_trims_padding_and_rejects_non_ascii() {
+        assert_eq!(sym(b"AAPL    ").as_str(), "AAPL");
+        assert_eq!(sym(b"BRK.B   ").as_str(), "BRK.B");
+        assert_eq!(sym(b"        ").as_str(), "");
+        assert_eq!(sym(b"ABCDEFGH").as_str(), "ABCDEFGH");
+        assert_eq!(Symbol::from_bytes([0xFF; 8]), None);
+        assert_eq!(Symbol::from_bytes(*b"\0\0\0\0\0\0\0\0"), None);
+        assert_eq!(sym(b"AAPL    ").raw(), *b"AAPL    ");
+    }
+
+    // ---- Dispatch ----
+
+    #[test]
+    fn parse_message_unknown_type_is_distinguishable_from_bad_length() {
+        assert_eq!(
+            parse_message(b"Z\x00\x00\x00\x00"),
+            Err(ParseError::UnknownType(b'Z'))
+        );
+        assert_eq!(
+            parse_message(&[]),
+            Err(ParseError::WrongLength {
+                expected: 1,
+                actual: 0
+            })
+        );
+        // Known type, wrong length: a different error entirely.
+        assert_eq!(
+            parse_message(b"S\x00\x00\x00\x00"),
+            Err(ParseError::WrongLength {
+                expected: 12,
+                actual: 5
+            })
         );
     }
 
     #[test]
-    fn parse_system_event_wrong_type_byte_returns_none() {
-        let mut bytes = system_event_bytes(1, 2, 0x0102_0304_0506, b'O');
-        bytes[0] = b'X';
-        assert!(parse_system_event(&bytes).is_none());
+    fn message_type_byte_round_trips() {
+        for message_type in MessageType::ALL {
+            let byte = message_type.as_byte();
+            assert_eq!(MessageType::from_byte(byte), Some(message_type));
+        }
     }
 
     #[test]
-    fn parse_system_event_truncated_returns_none() {
-        let mut bytes = system_event_bytes(1, 2, 0x0102_0304_0506, b'O');
-        bytes.pop();
-        assert!(parse_system_event(&bytes).is_none());
+    fn every_type_rejects_every_wrong_length() {
+        for message_type in MessageType::ALL {
+            let type_byte = message_type.as_byte();
+            let expected_len = message_type.message_len();
+            for len in 0..=60usize {
+                let mut bytes = vec![0u8; len];
+                if len > 0 {
+                    bytes[0] = type_byte;
+                }
+                let result = parse_message(&bytes);
+                if len != expected_len {
+                    assert!(
+                        result.is_err(),
+                        "{message_type:?} with length {len} should be rejected, got {result:?}"
+                    );
+                }
+                // The important assertion is that nothing above panicked.
+            }
+        }
     }
 
     #[test]
-    fn parse_message_dispatches_system_event() {
-        let bytes = system_event_bytes(1, 2, 0x0102_0304_0506, b'O');
+    fn every_enum_round_trips_and_has_a_catch_all() {
+        macro_rules! check_enum {
+            ($name:ident) => {
+                for byte in 0u8..=255 {
+                    let value = $name::from_byte(byte);
+                    assert_eq!(
+                        value.as_byte(),
+                        byte,
+                        concat!(stringify!($name), " must round-trip")
+                    );
+                }
+            };
+        }
+        check_enum!(EventCode);
+        check_enum!(MarketCategory);
+        check_enum!(TradingState);
+        check_enum!(HaltAction);
+        check_enum!(MarketCode);
+        check_enum!(CrossType);
+        check_enum!(ImbalanceDirection);
+        check_enum!(PriceVariationIndicator);
+        check_enum!(BreachedLevel);
+        check_enum!(OpenEligibilityStatus);
+        check_enum!(InterestFlag);
+        check_enum!(RegSHOAction);
+        check_enum!(Authenticity);
+        check_enum!(BuySell);
+
+        assert_eq!(EventCode::from_byte(b'C'), EventCode::EndOfMessages);
+        assert_eq!(EventCode::from_byte(b'x'), EventCode::Other(b'x'));
+        assert_eq!(BuySell::from_byte(b'B'), BuySell::Buy);
+        assert_eq!(BuySell::from_byte(b'?'), BuySell::Other(b'?'));
+    }
+
+    // ---- SystemEvent ----
+
+    fn system_event_bytes(locate: u16, tracking: u16, timestamp: u64, event_code: u8) -> Vec<u8> {
+        build(b'S', SYSTEM_EVENT_MESSAGE_LEN, |buf| {
+            push_header(buf, locate, tracking, timestamp);
+            buf.push(event_code);
+        })
+    }
+
+    #[test]
+    fn system_event_parses_and_detects_end_of_messages() {
+        let bytes = system_event_bytes(0x1234, 0x5678, TS, b'C');
+        let expected = SystemEventMessage {
+            stock_locate: 0x1234,
+            tracking_number: 0x5678,
+            timestamp: TS,
+            event_code: EventCode::EndOfMessages,
+        };
+        assert_eq!(parse_system_event(&bytes), Ok(expected));
         assert_eq!(
             parse_message(&bytes),
-            Some(ParsedMessage::SystemEvent(SystemEventMessage {
-                stock_locate: 1,
-                tracking_number: 2,
-                timestamp: 0x0102_0304_0506,
-                event_code: b'O',
-            }))
+            Ok(ParsedMessage::SystemEvent(expected))
         );
+        assert!(expected.is_end_of_messages());
+        assert_rejects(parse_system_event, &bytes);
+
+        let start = system_event_bytes(1, 2, TS, b'O');
+        assert!(!parse_system_event(&start).unwrap().is_end_of_messages());
+    }
+
+    // ---- StockDirectory ----
+
+    fn stock_directory_bytes() -> Vec<u8> {
+        build(b'R', STOCK_DIRECTORY_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"AAPL    ");
+            buf.push(b'Q'); // market category
+            buf.push(b'N'); // financial status
+            buf.extend_from_slice(&100u32.to_be_bytes());
+            buf.push(b'Y'); // round lots only
+            buf.push(b'C'); // issue classification
+            buf.extend_from_slice(b"XY"); // issue subtype
+            buf.push(b'P'); // authenticity
+            buf.push(b'N'); // short sale threshold
+            buf.push(b'Y'); // ipo flag
+            buf.push(b'1'); // luld tier
+            buf.push(b'N'); // etp flag
+            buf.extend_from_slice(&9999u32.to_be_bytes());
+            buf.push(b'N'); // inverse
+        })
     }
 
     #[test]
-    fn parse_message_unknown_type_byte_returns_none() {
-        assert!(parse_message(b"Z\x00\x00\x00\x00").is_none());
-    }
-
-    #[test]
-    fn parse_message_empty_returns_none() {
-        assert!(parse_message(&[]).is_none());
-    }
-
-    // ---- StockDirectoryMessage ----
-
-    #[allow(clippy::too_many_arguments)] // test-only builder, mirrors the wire format 1:1
-    fn stock_directory_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        market_category: u8,
-        financial_status_indicator: u8,
-        round_lot_size: u32,
-        round_lots_only: u8,
-        issue_classification: u8,
-        issue_subtype: [u8; 2],
-        authenticity: u8,
-        short_sale_threshold_indicator: u8,
-        ipo_flag: u8,
-        luld_reference_price_tier: u8,
-        etp_flag: u8,
-        etp_leverage_factor: u32,
-        inverse_indicator: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(STOCK_DIRECTORY_MESSAGE_LEN);
-        buf.push(b'R');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.push(market_category);
-        buf.push(financial_status_indicator);
-        buf.extend_from_slice(&round_lot_size.to_be_bytes());
-        buf.push(round_lots_only);
-        buf.push(issue_classification);
-        buf.extend_from_slice(&issue_subtype);
-        buf.push(authenticity);
-        buf.push(short_sale_threshold_indicator);
-        buf.push(ipo_flag);
-        buf.push(luld_reference_price_tier);
-        buf.push(etp_flag);
-        buf.extend_from_slice(&etp_leverage_factor.to_be_bytes());
-        buf.push(inverse_indicator);
-        // Sanity check on the builder itself -- if this ever fails, the bug
-        // is in the test helper, not in parse_stock_directory.
-        assert_eq!(buf.len(), STOCK_DIRECTORY_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_stock_directory_valid() {
-        // Every field gets a distinct, recognizable value specifically so
-        // that an offset collision (like financial_status_indicator and
-        // round_lot_size overlapping, which happened in an earlier draft)
-        // or a type mix-up shows up as a mismatch on the exact field that
-        // moved, not a vague overall failure.
-        let timestamp = 0x0a0b_0c0d_0e0fu64;
-        let stock = *b"AAPL    "; // space-padded, as the real feed sends it
-        let bytes = stock_directory_bytes(
-            0x1111, 0x2222, timestamp, stock, b'Q',   // market_category
-            b'N',   // financial_status_indicator
-            100,    // round_lot_size
-            b'Y',   // round_lots_only
-            b'C',   // issue_classification
-            *b"XY", // issue_subtype
-            b'P',   // authenticity
-            b'N',   // short_sale_threshold_indicator
-            b'Y',   // ipo_flag
-            b'1',   // luld_reference_price_tier
-            b'N',   // etp_flag
-            9999,   // etp_leverage_factor
-            b'N',   // inverse_indicator
-        );
-
-        let parsed = parse_stock_directory(&bytes).expect("should parse");
-
+    fn stock_directory_parses_every_field() {
+        let bytes = stock_directory_bytes();
+        let expected = StockDirectoryMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"AAPL    "),
+            market_category: MarketCategory::GlobalSelect,
+            financial_status_indicator: b'N',
+            round_lot_size: 100,
+            round_lots_only: true,
+            issue_classification: b'C',
+            issue_subtype: *b"XY",
+            authenticity: Authenticity::Production,
+            short_sale_threshold_indicator: false,
+            ipo_flag: true,
+            luld_reference_price_tier: b'1',
+            etp_flag: false,
+            etp_leverage_factor: 9999,
+            inverse_indicator: false,
+        };
+        assert_eq!(parse_stock_directory(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            StockDirectoryMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                market_category: b'Q',
-                financial_status_indicator: b'N',
-                round_lot_size: 100,
-                round_lots_only: b'Y',
-                issue_classification: b'C',
-                issue_subtype: *b"XY",
-                authenticity: b'P',
-                short_sale_threshold_indicator: b'N',
-                ipo_flag: b'Y',
-                luld_reference_price_tier: b'1',
-                etp_flag: b'N',
-                etp_leverage_factor: 9999,
-                inverse_indicator: b'N',
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::StockDirectory(expected))
         );
+        assert_rejects(parse_stock_directory, &bytes);
     }
 
     #[test]
-    fn parse_stock_directory_wrong_type_byte_returns_none() {
-        let mut bytes = stock_directory_bytes(
-            1,
-            2,
-            0x0a0b_0c0d_0e0f,
-            *b"AAPL    ",
-            b'Q',
-            b'N',
-            100,
-            b'Y',
-            b'C',
-            *b"XY",
-            b'P',
-            b'N',
-            b'Y',
-            b'1',
-            b'N',
-            9999,
-            b'N',
-        );
-        bytes[0] = b'Z';
-        assert!(parse_stock_directory(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_stock_directory_truncated_returns_none() {
-        let mut bytes = stock_directory_bytes(
-            1,
-            2,
-            0x0a0b_0c0d_0e0f,
-            *b"AAPL    ",
-            b'Q',
-            b'N',
-            100,
-            b'Y',
-            b'C',
-            *b"XY",
-            b'P',
-            b'N',
-            b'Y',
-            b'1',
-            b'N',
-            9999,
-            b'N',
-        );
-        bytes.pop();
-        assert!(parse_stock_directory(&bytes).is_none());
-    }
-
-    // ---- StockTradingActionMessage ----
-
-    fn stock_trading_action_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        trading_state: u8,
-        reserved: u8,
-        reason: [u8; 4],
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(STOCK_TRADING_ACTION_MESSAGE_LEN);
-        buf.push(b'H');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.push(trading_state);
-        buf.push(reserved);
-        buf.extend_from_slice(&reason);
-        // Sanity check on the builder itself -- if this fails, the bug is in
-        // the test helper, not in parse_stock_trading_action.
-        assert_eq!(buf.len(), STOCK_TRADING_ACTION_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_stock_trading_action_valid() {
-        // Distinct values in every field, including the adjacent single-byte
-        // trading_state/reserved pair, so an offset collision between them
-        // would surface as a specific mismatch rather than a coincidence.
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"MSFT    ";
-        let bytes =
-            stock_trading_action_bytes(0x1111, 0x2222, timestamp, stock, b'T', 0x00, *b"REG1");
-
-        let parsed = parse_stock_trading_action(&bytes).expect("should parse");
-
+    fn stock_directory_rejects_a_non_ascii_symbol() {
+        let mut bytes = stock_directory_bytes();
+        bytes[11] = 0xFF;
         assert_eq!(
-            parsed,
-            StockTradingActionMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                trading_state: b'T',
-                reserved: 0x00,
-                reason: *b"REG1",
-            }
+            parse_stock_directory(&bytes),
+            Err(ParseError::InvalidSymbol)
         );
     }
 
-    #[test]
-    fn parse_stock_trading_action_wrong_type_byte_returns_none() {
-        let mut bytes =
-            stock_trading_action_bytes(1, 2, 0x0102_0304_0506, *b"MSFT    ", b'T', 0x00, *b"REG1");
-        bytes[0] = b'Z';
-        assert!(parse_stock_trading_action(&bytes).is_none());
+    // ---- StockTradingAction ----
+
+    fn stock_trading_action_bytes() -> Vec<u8> {
+        build(b'H', STOCK_TRADING_ACTION_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"MSFT    ");
+            buf.push(b'T'); // trading state
+            buf.push(0x00); // reserved
+            buf.extend_from_slice(b"REG1");
+        })
     }
 
     #[test]
-    fn parse_stock_trading_action_truncated_returns_none() {
-        let mut bytes =
-            stock_trading_action_bytes(1, 2, 0x0102_0304_0506, *b"MSFT    ", b'T', 0x00, *b"REG1");
-        bytes.pop();
-        assert!(parse_stock_trading_action(&bytes).is_none());
-    }
-
-    // ---- RegSHOShortSalePriceTestRestrictedIndicatorMessage ----
-
-    fn reg_sho_bytes(
-        locate_code: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        reg_sho_action: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(REG_SHO_RESTRICTION_MESSAGE_LEN);
-        buf.push(b'Y');
-        buf.extend_from_slice(&locate_code.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.push(reg_sho_action);
-        // Sanity check on the builder itself -- if this fails, the bug is in
-        // the test helper, not in parse_reg_sho_short_sale_price_test_restricted_indicator.
-        assert_eq!(buf.len(), REG_SHO_RESTRICTION_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_reg_sho_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"TSLA    ";
-        let bytes = reg_sho_bytes(0x1111, 0x2222, timestamp, stock, b'1');
-
-        let parsed = parse_reg_sho_restriction(&bytes).expect("should parse");
-
+    fn stock_trading_action_parses() {
+        let bytes = stock_trading_action_bytes();
+        let expected = StockTradingActionMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"MSFT    "),
+            trading_state: TradingState::Trading,
+            reserved: 0,
+            reason: *b"REG1",
+        };
+        assert_eq!(parse_stock_trading_action(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            RegSHORestrictionMessage {
-                locate_code: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                reg_sho_action: b'1',
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::StockTradingAction(expected))
         );
+        assert_rejects(parse_stock_trading_action, &bytes);
+    }
+
+    // ---- RegSHO ----
+
+    fn reg_sho_bytes() -> Vec<u8> {
+        build(b'Y', REG_SHO_RESTRICTION_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"TSLA    ");
+            buf.push(b'1');
+        })
     }
 
     #[test]
-    fn parse_reg_sho_wrong_type_byte_returns_none() {
-        let mut bytes = reg_sho_bytes(1, 2, 0x0102_0304_0506, *b"TSLA    ", b'1');
-        bytes[0] = b'Z';
-        assert!(parse_reg_sho_restriction(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_reg_sho_truncated_returns_none() {
-        let mut bytes = reg_sho_bytes(1, 2, 0x0102_0304_0506, *b"TSLA    ", b'1');
-        bytes.pop();
-        assert!(parse_reg_sho_restriction(&bytes).is_none());
-    }
-
-    // ---- MarketParticipantPositionMessage ----
-
-    fn market_participant_position_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        mpid: [u8; 4],
-        stock: [u8; 8],
-        primary_market_maker: u8,
-        market_maker_mode: u8,
-        market_participant_state: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(MARKET_PARTICIPANT_MESSAGE_LEN);
-        buf.push(b'L');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&mpid);
-        buf.extend_from_slice(&stock);
-        buf.push(primary_market_maker);
-        buf.push(market_maker_mode);
-        buf.push(market_participant_state);
-        // Sanity check on the builder itself -- if this fails, the bug is in
-        // the test helper, not in parse_market_participant_position.
-        assert_eq!(buf.len(), MARKET_PARTICIPANT_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_market_participant_position_valid() {
-        // mpid and stock are adjacent 4-byte/8-byte fields -- distinct values
-        // in both catch an offset slip between them, same reasoning as the
-        // trading_state/reserved pair in StockTradingAction.
-        let timestamp = 0x0102_0304_0506u64;
-        let mpid = *b"ABCD";
-        let stock = *b"GOOG    ";
-        let bytes = market_participant_position_bytes(
-            0x1111, 0x2222, timestamp, mpid, stock, b'Y', b'1', b'A',
-        );
-
-        let parsed = parse_market_participant_position(&bytes).expect("should parse");
-
+    fn reg_sho_parses() {
+        let bytes = reg_sho_bytes();
+        let expected = RegSHORestrictionMessage {
+            locate_code: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"TSLA    "),
+            reg_sho_action: RegSHOAction::IntradayRestriction,
+        };
+        assert_eq!(parse_reg_sho_restriction(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            MarketParticipantPositionMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                mpid,
-                stock,
-                primary_market_maker: b'Y',
-                market_maker_mode: b'1',
-                market_participant_state: b'A',
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::RegSHORestriction(expected))
         );
+        assert_rejects(parse_reg_sho_restriction, &bytes);
+    }
+
+    // ---- MarketParticipantPosition ----
+
+    fn market_participant_matrix_bytes() -> Vec<u8> {
+        build(b'L', MARKET_PARTICIPANT_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"ABCD");
+            buf.extend_from_slice(b"GOOG    ");
+            buf.push(b'Y');
+            buf.push(b'1');
+            buf.push(b'A');
+        })
     }
 
     #[test]
-    fn parse_market_participant_position_wrong_type_byte_returns_none() {
-        let mut bytes = market_participant_position_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"ABCD",
-            *b"GOOG    ",
-            b'Y',
-            b'1',
-            b'A',
-        );
-        bytes[0] = b'Z';
-        assert!(parse_market_participant_position(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_market_participant_position_truncated_returns_none() {
-        let mut bytes = market_participant_position_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"ABCD",
-            *b"GOOG    ",
-            b'Y',
-            b'1',
-            b'A',
-        );
-        bytes.pop();
-        assert!(parse_market_participant_position(&bytes).is_none());
-    }
-
-    // ---- MWCBDeclineLevelMessage ----
-
-    fn mwcb_decline_level_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        level1: u64,
-        level2: u64,
-        level3: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(MWCB_DECLINE_LEVEL_MESSAGE_LEN);
-        buf.push(b'V');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&level1.to_be_bytes());
-        buf.extend_from_slice(&level2.to_be_bytes());
-        buf.extend_from_slice(&level3.to_be_bytes());
-        // Sanity check on the builder itself -- if this fails, the bug is in
-        // the test helper, not in parse_mwcb_decline_level.
-        assert_eq!(buf.len(), MWCB_DECLINE_LEVEL_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_mwcb_decline_level_valid() {
-        // Three adjacent 8-byte fields -- distinct values in each catch an
-        // offset slip between level1/level2/level3, same reasoning as the
-        // mpid/stock pair in MarketParticipantPosition.
-        let timestamp = 0x0102_0304_0506u64;
-        let (level1, level2, level3) = (1_000_000u64, 2_000_000u64, 3_000_000u64);
-        let bytes = mwcb_decline_level_bytes(0x1111, 0x2222, timestamp, level1, level2, level3);
-
-        let parsed = parse_mwcb_decline_level(&bytes).expect("should parse");
-
+    fn market_participant_position_parses() {
+        let bytes = market_participant_matrix_bytes();
+        let expected = MarketParticipantPositionMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            mpid: *b"ABCD",
+            stock: sym(b"GOOG    "),
+            primary_market_maker: true,
+            market_maker_mode: b'1',
+            market_participant_state: b'A',
+        };
+        assert_eq!(parse_market_participant_position(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            MWCBDeclineLevelMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                level1,
-                level2,
-                level3,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::MarketParticipantPosition(expected))
         );
+        assert_rejects(parse_market_participant_position, &bytes);
+    }
+
+    // ---- MWCB ----
+
+    #[test]
+    fn mwcb_decline_level_uses_the_1e_8_scale() {
+        let bytes = build(b'V', MWCB_DECLINE_LEVEL_MESSAGE_LEN, |buf| {
+            push_header(buf, 0, 0x2222, TS);
+            buf.extend_from_slice(&1_000_000_000_000u64.to_be_bytes());
+            buf.extend_from_slice(&2_000_000_000_000u64.to_be_bytes());
+            buf.extend_from_slice(&3_000_000_000_000u64.to_be_bytes());
+        });
+        let expected = MWCBDeclineLevelMessage {
+            stock_locate: 0,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            level1: p8(1_000_000_000_000),
+            level2: p8(2_000_000_000_000),
+            level3: p8(3_000_000_000_000),
+        };
+        assert_eq!(parse_mwcb_decline_level(&bytes), Ok(expected));
+        // 1e12 canonical units == 10,000.00000000 whole units, which is 1e8
+        // in Price (4) terms -- a scale mix-up would be four orders out.
+        assert_eq!(expected.level1.as_x10_8(), 1_000_000_000_000);
+        assert_rejects(parse_mwcb_decline_level, &bytes);
     }
 
     #[test]
-    fn parse_mwcb_decline_level_wrong_type_byte_returns_none() {
-        let mut bytes =
-            mwcb_decline_level_bytes(1, 2, 0x0102_0304_0506, 1_000_000, 2_000_000, 3_000_000);
-        bytes[0] = b'Z';
-        assert!(parse_mwcb_decline_level(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_mwcb_decline_level_truncated_returns_none() {
-        let mut bytes =
-            mwcb_decline_level_bytes(1, 2, 0x0102_0304_0506, 1_000_000, 2_000_000, 3_000_000);
-        bytes.pop();
-        assert!(parse_mwcb_decline_level(&bytes).is_none());
-    }
-
-    // ---- MWCBStatusMessage ----
-
-    fn mwcb_status_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        breached_level: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(MWCB_STATUS_MESSAGE_LEN);
-        buf.push(b'W');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.push(breached_level);
-        assert_eq!(buf.len(), MWCB_STATUS_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_mwcb_status_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let bytes = mwcb_status_bytes(0x1111, 0x2222, timestamp, b'1');
-
-        let parsed = parse_mwcb_status(&bytes).expect("should parse");
-
+    fn mwcb_status_parses() {
+        let bytes = build(b'W', MWCB_STATUS_MESSAGE_LEN, |buf| {
+            push_header(buf, 0, 0x2222, TS);
+            buf.push(b'2');
+        });
+        let expected = MWCBStatusMessage {
+            stock_locate: 0,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            breached_level: BreachedLevel::Level2,
+        };
+        assert_eq!(parse_mwcb_status(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            MWCBStatusMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                breached_level: b'1',
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::MWCBStatus(expected))
         );
+        assert_rejects(parse_mwcb_status, &bytes);
     }
+
+    // ---- IPO ----
 
     #[test]
-    fn parse_mwcb_status_wrong_type_byte_returns_none() {
-        let mut bytes = mwcb_status_bytes(1, 2, 0x0102_0304_0506, b'1');
-        bytes[0] = b'Z';
-        assert!(parse_mwcb_status(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_mwcb_status_truncated_returns_none() {
-        let mut bytes = mwcb_status_bytes(1, 2, 0x0102_0304_0506, b'1');
-        bytes.pop();
-        assert!(parse_mwcb_status(&bytes).is_none());
-    }
-
-    // ---- IPOQuotingPeriodUpdateMessage ----
-
-    fn ipo_quoting_period_update_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        ipo_quotation_release_time: u32,
-        ipo_quotation_release_qualifier: u8,
-        ipo_price: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(IPO_QUOTATION_REQUEST_MESSAGE_LEN);
-        buf.push(b'K');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&ipo_quotation_release_time.to_be_bytes());
-        buf.push(ipo_quotation_release_qualifier);
-        buf.extend_from_slice(&ipo_price.to_be_bytes());
-        assert_eq!(buf.len(), IPO_QUOTATION_REQUEST_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_ipo_quoting_period_update_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"ABCD    ";
-        let bytes = ipo_quoting_period_update_bytes(
-            0x1111, 0x2222, timestamp, stock, 34_200, b'A', 200_000,
-        );
-
-        let parsed = parse_ipo_quoting_period_update(&bytes).expect("should parse");
-
+    fn ipo_quoting_period_update_parses() {
+        let bytes = build(b'K', IPO_QUOTATION_REQUEST_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"ABCD    ");
+            buf.extend_from_slice(&34_200u32.to_be_bytes());
+            buf.push(b'A');
+            buf.extend_from_slice(&200_000u32.to_be_bytes());
+        });
+        let expected = IPOQuotingPeriodUpdateMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"ABCD    "),
+            ipo_quotation_release_time: 34_200,
+            ipo_quotation_release_qualifier: b'A',
+            ipo_price: p4(200_000),
+        };
+        assert_eq!(parse_ipo_quoting_period_update(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            IPOQuotingPeriodUpdateMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                ipo_quotation_release_time: 34_200,
-                ipo_quotation_release_qualifier: b'A',
-                ipo_price: 200_000,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::IPOQuotingPeriodUpdate(expected))
         );
+        assert_rejects(parse_ipo_quoting_period_update, &bytes);
     }
+
+    // ---- LULD ----
 
     #[test]
-    fn parse_ipo_quoting_period_update_wrong_type_byte_returns_none() {
-        let mut bytes = ipo_quoting_period_update_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"ABCD    ",
-            34_200,
-            b'A',
-            200_000,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_ipo_quoting_period_update(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_ipo_quoting_period_update_truncated_returns_none() {
-        let mut bytes = ipo_quoting_period_update_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"ABCD    ",
-            34_200,
-            b'A',
-            200_000,
-        );
-        bytes.pop();
-        assert!(parse_ipo_quoting_period_update(&bytes).is_none());
-    }
-
-    // ---- LULDAuctionCollarMessage ----
-
-    fn luld_auction_collar_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        auction_collar_reference_price: u32,
-        upper_auction_collar_price: u32,
-        lower_auction_collar_price: u32,
-        auction_collar_extension: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(LULD_ACTION_MESSAGE_LEN);
-        buf.push(b'J');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&auction_collar_reference_price.to_be_bytes());
-        buf.extend_from_slice(&upper_auction_collar_price.to_be_bytes());
-        buf.extend_from_slice(&lower_auction_collar_price.to_be_bytes());
-        buf.extend_from_slice(&auction_collar_extension.to_be_bytes());
-        assert_eq!(buf.len(), LULD_ACTION_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_luld_action_collar_valid() {
-        // Four adjacent 4-byte fields -- distinct values in each catch an
-        // offset slip between any pair of them.
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"EFGH    ";
-        let bytes = luld_auction_collar_bytes(
-            0x1111, 0x2222, timestamp, stock, 100_000, 110_000, 90_000, 2,
-        );
-
-        let parsed = parse_luld_action_collar(&bytes).expect("should parse");
-
+    fn luld_auction_collar_parses() {
+        let bytes = build(b'J', LULD_ACTION_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"EFGH    ");
+            buf.extend_from_slice(&100_000u32.to_be_bytes());
+            buf.extend_from_slice(&110_000u32.to_be_bytes());
+            buf.extend_from_slice(&90_000u32.to_be_bytes());
+            buf.extend_from_slice(&2u32.to_be_bytes());
+        });
+        let expected = LULDAuctionCollarMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"EFGH    "),
+            auction_collar_reference_price: p4(100_000),
+            upper_auction_collar_price: p4(110_000),
+            lower_auction_collar_price: p4(90_000),
+            auction_collar_extension: 2,
+        };
+        assert_eq!(parse_luld_action_collar(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            LULDAuctionCollarMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                auction_collar_reference_price: 100_000,
-                upper_auction_collar_price: 110_000,
-                lower_auction_collar_price: 90_000,
-                auction_collar_extension: 2,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::LULDAuctionCollar(expected))
         );
+        assert_rejects(parse_luld_action_collar, &bytes);
     }
+
+    // ---- OperationalHalt ----
 
     #[test]
-    fn parse_luld_action_collar_wrong_type_byte_returns_none() {
-        let mut bytes = luld_auction_collar_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"EFGH    ",
-            100_000,
-            110_000,
-            90_000,
-            2,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_luld_action_collar(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_luld_action_collar_truncated_returns_none() {
-        let mut bytes = luld_auction_collar_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"EFGH    ",
-            100_000,
-            110_000,
-            90_000,
-            2,
-        );
-        bytes.pop();
-        assert!(parse_luld_action_collar(&bytes).is_none());
-    }
-
-    // ---- OperationalHaltMessage ----
-
-    fn operational_halt_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        market_code: u8,
-        operational_halt_action: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(OPERATIONAL_HALT_MESSAGE_LEN);
-        buf.push(b'h');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.push(market_code);
-        buf.push(operational_halt_action);
-        assert_eq!(buf.len(), OPERATIONAL_HALT_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_operational_halt_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"IJKL    ";
-        let bytes = operational_halt_bytes(0x1111, 0x2222, timestamp, stock, b'Q', b'H');
-
-        let parsed = parse_operational_halt(&bytes).expect("should parse");
-
+    fn operational_halt_parses() {
+        let bytes = build(b'h', OPERATIONAL_HALT_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"IJKL    ");
+            buf.push(b'Q');
+            buf.push(b'H');
+        });
+        let expected = OperationalHaltMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"IJKL    "),
+            market_code: MarketCode::Nasdaq,
+            operational_halt_action: HaltAction::Halted,
+        };
+        assert_eq!(parse_operational_halt(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            OperationalHaltMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                market_code: b'Q',
-                operational_halt_action: b'H',
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::OperationalHalt(expected))
         );
+        assert_rejects(parse_operational_halt, &bytes);
+    }
+
+    // ---- AddOrder ----
+
+    fn add_order_bytes() -> Vec<u8> {
+        build(b'A', ADD_ORDER_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.push(b'B');
+            buf.extend_from_slice(&500u32.to_be_bytes());
+            buf.extend_from_slice(b"NVDA    ");
+            buf.extend_from_slice(&1_425_000u32.to_be_bytes());
+        })
     }
 
     #[test]
-    fn parse_operational_halt_wrong_type_byte_returns_none() {
-        let mut bytes = operational_halt_bytes(1, 2, 0x0102_0304_0506, *b"IJKL    ", b'Q', b'H');
-        bytes[0] = b'Z';
-        assert!(parse_operational_halt(&bytes).is_none());
+    fn add_order_parses() {
+        let bytes = add_order_bytes();
+        let expected = AddOrderMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+            buy_sell_indicator: BuySell::Buy,
+            shares: 500,
+            stock: sym(b"NVDA    "),
+            price: p4(1_425_000),
+        };
+        assert_eq!(parse_add_order(&bytes), Ok(expected));
+        assert_eq!(parse_message(&bytes), Ok(ParsedMessage::AddOrder(expected)));
+        assert_rejects(parse_add_order, &bytes);
     }
+
+    // ---- AddOrderMPIDAttribution ----
 
     #[test]
-    fn parse_operational_halt_truncated_returns_none() {
-        let mut bytes = operational_halt_bytes(1, 2, 0x0102_0304_0506, *b"IJKL    ", b'Q', b'H');
-        bytes.pop();
-        assert!(parse_operational_halt(&bytes).is_none());
-    }
-
-    // ---- AddOrderMessage ----
-
-    fn add_order_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-        buy_sell_indicator: u8,
-        shares: u32,
-        stock: [u8; 8],
-        price: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ADD_ORDER_MESSAGE_LEN);
-        buf.push(b'A');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        buf.push(buy_sell_indicator);
-        buf.extend_from_slice(&shares.to_be_bytes());
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&price.to_be_bytes());
-        assert_eq!(buf.len(), ADD_ORDER_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_add_order_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let stock = *b"NVDA    ";
-        let bytes = add_order_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            order_reference_number,
-            b'B',
-            500,
-            stock,
-            1_425_000,
-        );
-
-        let parsed = parse_add_order(&bytes).expect("should parse");
-
+    fn add_order_mpid_attribution_parses() {
+        let bytes = build(b'F', ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.push(b'S');
+            buf.extend_from_slice(&300u32.to_be_bytes());
+            buf.extend_from_slice(b"AMD     ");
+            buf.extend_from_slice(&850_000u32.to_be_bytes());
+            buf.extend_from_slice(b"EDGX");
+        });
+        let expected = AddOrderMPIDAttributionMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+            buy_sell_indicator: BuySell::Sell,
+            shares: 300,
+            stock: sym(b"AMD     "),
+            price: p4(850_000),
+            attribution: *b"EDGX",
+        };
+        assert_eq!(parse_add_order_mpid_attribution(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            AddOrderMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-                buy_sell_indicator: b'B',
-                shares: 500,
-                stock,
-                price: 1_425_000,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::AddOrderMPIDAttribution(expected))
         );
+        assert_rejects(parse_add_order_mpid_attribution, &bytes);
     }
+
+    // ---- OrderExecuted ----
 
     #[test]
-    fn parse_add_order_wrong_type_byte_returns_none() {
-        let mut bytes = add_order_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            b'B',
-            500,
-            *b"NVDA    ",
-            1_425_000,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_add_order(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_add_order_truncated_returns_none() {
-        let mut bytes = add_order_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            b'B',
-            500,
-            *b"NVDA    ",
-            1_425_000,
-        );
-        bytes.pop();
-        assert!(parse_add_order(&bytes).is_none());
-    }
-
-    // ---- AddOrderMPIDAttributionMessage ----
-
-    #[allow(clippy::too_many_arguments)] // test-only builder, mirrors the wire format 1:1
-    fn add_order_mpid_attribution_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-        buy_sell_indicator: u8,
-        shares: u32,
-        stock: [u8; 8],
-        price: u32,
-        attribution: [u8; 4],
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN);
-        buf.push(b'F');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        buf.push(buy_sell_indicator);
-        buf.extend_from_slice(&shares.to_be_bytes());
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&price.to_be_bytes());
-        buf.extend_from_slice(&attribution);
-        assert_eq!(buf.len(), ADD_ORDER_MPID_ATTRIBUTION_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_add_order_mpid_attribution_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let stock = *b"AMD     ";
-        let bytes = add_order_mpid_attribution_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            order_reference_number,
-            b'S',
-            300,
-            stock,
-            850_000,
-            *b"EDGX",
-        );
-
-        let parsed = parse_add_order_mpid_attribution(&bytes).expect("should parse");
-
+    fn order_executed_parses() {
+        let bytes = build(b'E', ORDER_EXECUTED_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.extend_from_slice(&200u32.to_be_bytes());
+            buf.extend_from_slice(&0x99AA_BBCC_DDEE_FF00u64.to_be_bytes());
+        });
+        let expected = OrderExecutedMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+            executed_shares: 200,
+            match_number: 0x99AA_BBCC_DDEE_FF00,
+        };
+        assert_eq!(parse_order_executed(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            AddOrderMPIDAttributionMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-                buy_sell_indicator: b'S',
-                shares: 300,
-                stock,
-                price: 850_000,
-                attribution: *b"EDGX",
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::OrderExecuted(expected))
         );
+        assert_rejects(parse_order_executed, &bytes);
     }
+
+    // ---- OrderExecutedPrice ----
 
     #[test]
-    fn parse_add_order_mpid_attribution_wrong_type_byte_returns_none() {
-        let mut bytes = add_order_mpid_attribution_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            b'S',
-            300,
-            *b"AMD     ",
-            850_000,
-            *b"EDGX",
-        );
-        bytes[0] = b'Z';
-        assert!(parse_add_order_mpid_attribution(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_add_order_mpid_attribution_truncated_returns_none() {
-        let mut bytes = add_order_mpid_attribution_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            b'S',
-            300,
-            *b"AMD     ",
-            850_000,
-            *b"EDGX",
-        );
-        bytes.pop();
-        assert!(parse_add_order_mpid_attribution(&bytes).is_none());
-    }
-
-    // ---- OrderExecutedMessage ----
-
-    fn order_executed_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-        executed_shares: u32,
-        match_number: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ORDER_EXECUTED_MESSAGE_LEN);
-        buf.push(b'E');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        buf.extend_from_slice(&executed_shares.to_be_bytes());
-        buf.extend_from_slice(&match_number.to_be_bytes());
-        assert_eq!(buf.len(), ORDER_EXECUTED_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_order_executed_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
-        let bytes = order_executed_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            order_reference_number,
-            200,
-            match_number,
-        );
-
-        let parsed = parse_order_executed(&bytes).expect("should parse");
-
+    fn order_executed_price_parses() {
+        let bytes = build(b'C', ORDER_EXECUTED_PRICE_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.extend_from_slice(&150u32.to_be_bytes());
+            buf.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+            buf.push(b'Y');
+            buf.extend_from_slice(&1_430_000u32.to_be_bytes());
+        });
+        let expected = OrderExecutedPriceMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+            executed_shares: 150,
+            match_number: 0x0102_0304_0506_0708,
+            printable: true,
+            execution_price: p4(1_430_000),
+        };
+        assert_eq!(parse_order_executed_price(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            OrderExecutedMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-                executed_shares: 200,
-                match_number,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::OrderExecutedPrice(expected))
         );
+        assert_rejects(parse_order_executed_price, &bytes);
     }
+
+    // ---- OrderCancel ----
 
     #[test]
-    fn parse_order_executed_wrong_type_byte_returns_none() {
-        let mut bytes = order_executed_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            200,
-            0x99AA_BBCC_DDEE_FF00,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_order_executed(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_order_executed_truncated_returns_none() {
-        let mut bytes = order_executed_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            200,
-            0x99AA_BBCC_DDEE_FF00,
-        );
-        bytes.pop();
-        assert!(parse_order_executed(&bytes).is_none());
-    }
-
-    // ---- OrderExecutedPriceMessage ----
-
-    #[allow(clippy::too_many_arguments)] // test-only builder, mirrors the wire format 1:1
-    fn order_executed_price_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-        executed_shares: u32,
-        match_number: u64,
-        printable: u8,
-        execution_price: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ORDER_EXECUTED_PRICE_MESSAGE_LEN);
-        buf.push(b'C');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        buf.extend_from_slice(&executed_shares.to_be_bytes());
-        buf.extend_from_slice(&match_number.to_be_bytes());
-        buf.push(printable);
-        buf.extend_from_slice(&execution_price.to_be_bytes());
-        assert_eq!(buf.len(), ORDER_EXECUTED_PRICE_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_order_executed_price_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
-        let bytes = order_executed_price_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            order_reference_number,
-            200,
-            match_number,
-            b'Y',
-            1_425_000,
-        );
-
-        let parsed = parse_order_executed_price(&bytes).expect("should parse");
-
+    fn order_cancel_parses() {
+        let bytes = build(b'X', ORDER_CANCEL_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.extend_from_slice(&75u32.to_be_bytes());
+        });
+        let expected = OrderCancelMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+            cancelled_shares: 75,
+        };
+        assert_eq!(parse_order_cancel(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            OrderExecutedPriceMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-                executed_shares: 200,
-                match_number,
-                printable: b'Y',
-                execution_price: 1_425_000,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::OrderCancel(expected))
         );
+        assert_rejects(parse_order_cancel, &bytes);
     }
+
+    // ---- OrderDelete ----
 
     #[test]
-    fn parse_order_executed_price_wrong_type_byte_returns_none() {
-        let mut bytes = order_executed_price_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            200,
-            0x99AA_BBCC_DDEE_FF00,
-            b'Y',
-            1_425_000,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_order_executed_price(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_order_executed_price_truncated_returns_none() {
-        let mut bytes = order_executed_price_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            200,
-            0x99AA_BBCC_DDEE_FF00,
-            b'Y',
-            1_425_000,
-        );
-        bytes.pop();
-        assert!(parse_order_executed_price(&bytes).is_none());
-    }
-
-    // ---- OrderCancelMessage ----
-
-    fn order_cancel_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-        cancelled_shares: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ORDER_CANCEL_MESSAGE_LEN);
-        buf.push(b'X');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        buf.extend_from_slice(&cancelled_shares.to_be_bytes());
-        assert_eq!(buf.len(), ORDER_CANCEL_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_order_cancel_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let bytes = order_cancel_bytes(0x1111, 0x2222, timestamp, order_reference_number, 150);
-
-        let parsed = parse_order_cancel(&bytes).expect("should parse");
-
+    fn order_delete_parses() {
+        let bytes = build(b'D', ORDER_DELETE_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+        });
+        let expected = OrderDeleteMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(parse_order_delete(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            OrderCancelMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-                cancelled_shares: 150,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::OrderDelete(expected))
         );
+        assert_rejects(parse_order_delete, &bytes);
     }
+
+    // ---- OrderReplace ----
 
     #[test]
-    fn parse_order_cancel_wrong_type_byte_returns_none() {
-        let mut bytes = order_cancel_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 150);
-        bytes[0] = b'Z';
-        assert!(parse_order_cancel(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_order_cancel_truncated_returns_none() {
-        let mut bytes = order_cancel_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788, 150);
-        bytes.pop();
-        assert!(parse_order_cancel(&bytes).is_none());
-    }
-
-    // ---- OrderDeleteMessage ----
-
-    fn order_delete_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ORDER_DELETE_MESSAGE_LEN);
-        buf.push(b'D');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        assert_eq!(buf.len(), ORDER_DELETE_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_order_delete_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let bytes = order_delete_bytes(0x1111, 0x2222, timestamp, order_reference_number);
-
-        let parsed = parse_order_delete(&bytes).expect("should parse");
-
+    fn order_replace_parses() {
+        let bytes = build(b'U', ORDER_REPLACE_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.extend_from_slice(&0x8877_6655_4433_2211u64.to_be_bytes());
+            buf.extend_from_slice(&900u32.to_be_bytes());
+            buf.extend_from_slice(&1_500_000u32.to_be_bytes());
+        });
+        let expected = OrderReplaceMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            original_order_reference_number: 0x1122_3344_5566_7788,
+            new_order_reference_number: 0x8877_6655_4433_2211,
+            shares: 900,
+            price: p4(1_500_000),
+        };
+        assert_eq!(parse_order_replace(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            OrderDeleteMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::OrderReplace(expected))
         );
+        assert_rejects(parse_order_replace, &bytes);
     }
+
+    // ---- Trade ----
 
     #[test]
-    fn parse_order_delete_wrong_type_byte_returns_none() {
-        let mut bytes = order_delete_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788);
-        bytes[0] = b'Z';
-        assert!(parse_order_delete(&bytes).is_none());
+    fn trade_parses() {
+        let bytes = build(b'P', TRADE_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            buf.push(b'S');
+            buf.extend_from_slice(&100u32.to_be_bytes());
+            buf.extend_from_slice(b"TSLA    ");
+            buf.extend_from_slice(&2_500_000u32.to_be_bytes());
+            buf.extend_from_slice(&0xDEAD_BEEF_CAFE_1234u64.to_be_bytes());
+        });
+        let expected = TradeMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            order_reference_number: 0x1122_3344_5566_7788,
+            buy_sell_indicator: BuySell::Sell,
+            shares: 100,
+            stock: sym(b"TSLA    "),
+            price: p4(2_500_000),
+            match_number: 0xDEAD_BEEF_CAFE_1234,
+        };
+        assert_eq!(parse_trade(&bytes), Ok(expected));
+        assert_eq!(parse_message(&bytes), Ok(ParsedMessage::Trade(expected)));
+        assert_rejects(parse_trade, &bytes);
     }
+
+    // ---- CrossTrade ----
 
     #[test]
-    fn parse_order_delete_truncated_returns_none() {
-        let mut bytes = order_delete_bytes(1, 2, 0x0102_0304_0506, 0x1122_3344_5566_7788);
-        bytes.pop();
-        assert!(parse_order_delete(&bytes).is_none());
-    }
-
-    // ---- OrderReplaceMessage ----
-
-    fn order_replace_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        original_order_reference_number: u64,
-        new_order_reference_number: u64,
-        shares: u32,
-        price: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ORDER_REPLACE_MESSAGE_LEN);
-        buf.push(b'U');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&original_order_reference_number.to_be_bytes());
-        buf.extend_from_slice(&new_order_reference_number.to_be_bytes());
-        buf.extend_from_slice(&shares.to_be_bytes());
-        buf.extend_from_slice(&price.to_be_bytes());
-        assert_eq!(buf.len(), ORDER_REPLACE_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_order_replace_valid() {
-        // original/new order reference numbers are adjacent 8-byte fields --
-        // distinct values catch an offset slip between them, same reasoning
-        // as every other adjacent-field pair tested so far.
-        let timestamp = 0x0102_0304_0506u64;
-        let original_order_reference_number = 0x1111_1111_1111_1111u64;
-        let new_order_reference_number = 0x2222_2222_2222_2222u64;
-        let bytes = order_replace_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            original_order_reference_number,
-            new_order_reference_number,
-            400,
-            1_500_000,
-        );
-
-        let parsed = parse_order_replace(&bytes).expect("should parse");
-
+    fn cross_trade_parses_with_an_8_byte_share_count() {
+        let bytes = build(b'Q', CROSS_TRADE_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x0000_0001_0000_0000u64.to_be_bytes());
+            buf.extend_from_slice(b"AAPL    ");
+            buf.extend_from_slice(&1_000_000u32.to_be_bytes());
+            buf.extend_from_slice(&0x0F1E_2D3C_4B5A_6978u64.to_be_bytes());
+            buf.push(b'O');
+        });
+        let expected = CrossTradeMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            shares: 0x0000_0001_0000_0000,
+            stock: sym(b"AAPL    "),
+            cross_price: p4(1_000_000),
+            match_number: 0x0F1E_2D3C_4B5A_6978,
+            cross_type: CrossType::Opening,
+        };
+        assert_eq!(parse_cross_trade(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            OrderReplaceMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                original_order_reference_number,
-                new_order_reference_number,
-                shares: 400,
-                price: 1_500_000,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::CrossTrade(expected))
         );
+        assert_rejects(parse_cross_trade, &bytes);
     }
+
+    // ---- BrokenTrade ----
 
     #[test]
-    fn parse_order_replace_wrong_type_byte_returns_none() {
-        let mut bytes = order_replace_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1111_1111_1111_1111,
-            0x2222_2222_2222_2222,
-            400,
-            1_500_000,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_order_replace(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_order_replace_truncated_returns_none() {
-        let mut bytes = order_replace_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1111_1111_1111_1111,
-            0x2222_2222_2222_2222,
-            400,
-            1_500_000,
-        );
-        bytes.pop();
-        assert!(parse_order_replace(&bytes).is_none());
-    }
-
-    // ---- TradeMessage ----
-
-    #[allow(clippy::too_many_arguments)]
-    fn trade_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        order_reference_number: u64,
-        buy_sell_indicator: u8,
-        shares: u32,
-        stock: [u8; 8],
-        price: u32,
-        match_number: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(TRADE_MESSAGE_LEN);
-        buf.push(b'P');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&order_reference_number.to_be_bytes());
-        buf.push(buy_sell_indicator);
-        buf.extend_from_slice(&shares.to_be_bytes());
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&price.to_be_bytes());
-        buf.extend_from_slice(&match_number.to_be_bytes());
-        assert_eq!(buf.len(), TRADE_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_trade_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let order_reference_number = 0x1122_3344_5566_7788u64;
-        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
-        let stock = *b"SPY     ";
-        let bytes = trade_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            order_reference_number,
-            b'B',
-            100,
-            stock,
-            450_000,
-            match_number,
-        );
-
-        let parsed = parse_trade(&bytes).expect("should parse");
-
+    fn broken_trade_parses() {
+        let bytes = build(b'B', BROKEN_TRADE_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&0x0F1E_2D3C_4B5A_6978u64.to_be_bytes());
+        });
+        let expected = BrokenTradeMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            match_number: 0x0F1E_2D3C_4B5A_6978,
+        };
+        assert_eq!(parse_broken_trade(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            TradeMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                order_reference_number,
-                buy_sell_indicator: b'B',
-                shares: 100,
-                stock,
-                price: 450_000,
-                match_number,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::BrokenTrade(expected))
         );
+        assert_rejects(parse_broken_trade, &bytes);
     }
+
+    // ---- NOII ----
 
     #[test]
-    fn parse_trade_wrong_type_byte_returns_none() {
-        let mut bytes = trade_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            b'B',
-            100,
-            *b"SPY     ",
-            450_000,
-            0x99AA_BBCC_DDEE_FF00,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_trade(&bytes).is_none());
+    fn noii_parses() {
+        let bytes = build(b'I', NOII_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(&10_000u64.to_be_bytes());
+            buf.extend_from_slice(&500u64.to_be_bytes());
+            buf.push(b'B');
+            buf.extend_from_slice(b"IBM     ");
+            buf.extend_from_slice(&101_000u32.to_be_bytes());
+            buf.extend_from_slice(&100_500u32.to_be_bytes());
+            buf.extend_from_slice(&100_000u32.to_be_bytes());
+            buf.push(b'O');
+            buf.push(b'L');
+        });
+        let expected = NOIIMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            paired_shares: 10_000,
+            imbalance_shares: 500,
+            imbalance_direction: ImbalanceDirection::Buy,
+            stock: sym(b"IBM     "),
+            far_price: p4(101_000),
+            near_price: p4(100_500),
+            current_reference_price: p4(100_000),
+            cross_type: CrossType::Opening,
+            price_variation_indicator: PriceVariationIndicator::LessThanOnePercent,
+        };
+        assert_eq!(parse_noii(&bytes), Ok(expected));
+        assert_eq!(parse_message(&bytes), Ok(ParsedMessage::NOII(expected)));
+        assert_rejects(parse_noii, &bytes);
     }
+
+    // ---- RPII ----
 
     #[test]
-    fn parse_trade_truncated_returns_none() {
-        let mut bytes = trade_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            0x1122_3344_5566_7788,
-            b'B',
-            100,
-            *b"SPY     ",
-            450_000,
-            0x99AA_BBCC_DDEE_FF00,
-        );
-        bytes.pop();
-        assert!(parse_trade(&bytes).is_none());
+    fn rpii_parses() {
+        let bytes = build(b'N', RPII_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"SPY     ");
+            buf.push(b'B');
+        });
+        let expected = RPIIMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"SPY     "),
+            interest_flag: InterestFlag::Bid,
+        };
+        assert_eq!(parse_rpii(&bytes), Ok(expected));
+        assert_eq!(parse_message(&bytes), Ok(ParsedMessage::RPII(expected)));
+        assert_rejects(parse_rpii, &bytes);
     }
 
-    // ---- CrossTradeMessage ----
-
-    fn cross_trade_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        shares: u64,
-        stock: [u8; 8],
-        cross_price: u32,
-        match_number: u64,
-        cross_type: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(CROSS_TRADE_MESSAGE_LEN);
-        buf.push(b'Q');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&shares.to_be_bytes());
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&cross_price.to_be_bytes());
-        buf.extend_from_slice(&match_number.to_be_bytes());
-        buf.push(cross_type);
-        assert_eq!(buf.len(), CROSS_TRADE_MESSAGE_LEN);
-        buf
-    }
+    // ---- DLCR ----
 
     #[test]
-    fn parse_cross_trade_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
-        let stock = *b"QQQ     ";
-        let bytes = cross_trade_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            50_000,
-            stock,
-            380_000,
-            match_number,
-            b'O',
-        );
-
-        let parsed = parse_cross_trade(&bytes).expect("should parse");
-
-        assert_eq!(
-            parsed,
-            CrossTradeMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                shares: 50_000,
-                stock,
-                cross_price: 380_000,
-                match_number,
-                cross_type: b'O',
-            }
-        );
-    }
-
-    #[test]
-    fn parse_cross_trade_wrong_type_byte_returns_none() {
-        let mut bytes = cross_trade_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            50_000,
-            *b"QQQ     ",
-            380_000,
-            0x99AA_BBCC_DDEE_FF00,
-            b'O',
-        );
-        bytes[0] = b'Z';
-        assert!(parse_cross_trade(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_cross_trade_truncated_returns_none() {
-        let mut bytes = cross_trade_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            50_000,
-            *b"QQQ     ",
-            380_000,
-            0x99AA_BBCC_DDEE_FF00,
-            b'O',
-        );
-        bytes.pop();
-        assert!(parse_cross_trade(&bytes).is_none());
-    }
-
-    // ---- BrokenTradeMessage ----
-
-    fn broken_trade_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        match_number: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(BROKEN_TRADE_MESSAGE_LEN);
-        buf.push(b'B');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&match_number.to_be_bytes());
-        assert_eq!(buf.len(), BROKEN_TRADE_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_broken_trade_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let match_number = 0x99AA_BBCC_DDEE_FF00u64;
-        let bytes = broken_trade_bytes(0x1111, 0x2222, timestamp, match_number);
-
-        let parsed = parse_broken_trade(&bytes).expect("should parse");
-
-        assert_eq!(
-            parsed,
-            BrokenTradeMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                match_number,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_broken_trade_wrong_type_byte_returns_none() {
-        let mut bytes = broken_trade_bytes(1, 2, 0x0102_0304_0506, 0x99AA_BBCC_DDEE_FF00);
-        bytes[0] = b'Z';
-        assert!(parse_broken_trade(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_broken_trade_truncated_returns_none() {
-        let mut bytes = broken_trade_bytes(1, 2, 0x0102_0304_0506, 0x99AA_BBCC_DDEE_FF00);
-        bytes.pop();
-        assert!(parse_broken_trade(&bytes).is_none());
-    }
-
-    // ---- NOIIMessage ----
-
-    #[allow(clippy::too_many_arguments)]
-    fn noii_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        paired_shares: u64,
-        imbalance_shares: u64,
-        imbalance_direction: u8,
-        stock: [u8; 8],
-        far_price: u32,
-        near_price: u32,
-        current_reference_price: u32,
-        cross_type: u8,
-        price_variation_indicator: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(NOII_MESSAGE_LEN);
-        buf.push(b'I');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&paired_shares.to_be_bytes());
-        buf.extend_from_slice(&imbalance_shares.to_be_bytes());
-        buf.push(imbalance_direction);
-        buf.extend_from_slice(&stock);
-        buf.extend_from_slice(&far_price.to_be_bytes());
-        buf.extend_from_slice(&near_price.to_be_bytes());
-        buf.extend_from_slice(&current_reference_price.to_be_bytes());
-        buf.push(cross_type);
-        buf.push(price_variation_indicator);
-        assert_eq!(buf.len(), NOII_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_noii_valid() {
-        // far_price/near_price/current_reference_price are three adjacent
-        // 4-byte fields -- distinct values catch an offset slip among them.
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"IBM     ";
-        let bytes = noii_bytes(
-            0x1111, 0x2222, timestamp, 10_000, 500, b'B', stock, 100_000, 101_000, 100_500, b'O',
-            b'L',
-        );
-
-        let parsed = parse_noii(&bytes).expect("should parse");
-
-        assert_eq!(
-            parsed,
-            NOIIMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                paired_shares: 10_000,
-                imbalance_shares: 500,
-                imbalance_direction: b'B',
-                stock,
-                far_price: 100_000,
-                near_price: 101_000,
-                current_reference_price: 100_500,
-                cross_type: b'O',
-                price_variation_indicator: b'L',
-            }
-        );
-    }
-
-    #[test]
-    fn parse_noii_wrong_type_byte_returns_none() {
-        let mut bytes = noii_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            10_000,
-            500,
-            b'B',
-            *b"IBM     ",
-            100_000,
-            101_000,
-            100_500,
-            b'O',
-            b'L',
-        );
-        bytes[0] = b'Z';
-        assert!(parse_noii(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_noii_truncated_returns_none() {
-        let mut bytes = noii_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            10_000,
-            500,
-            b'B',
-            *b"IBM     ",
-            100_000,
-            101_000,
-            100_500,
-            b'O',
-            b'L',
-        );
-        bytes.pop();
-        assert!(parse_noii(&bytes).is_none());
-    }
-
-    // ---- RPIIMessage ----
-
-    fn rpii_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        interest_flag: u8,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(RPII_MESSAGE_LEN);
-        buf.push(b'N');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.push(interest_flag);
-        assert_eq!(buf.len(), RPII_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_rpii_valid() {
-        let timestamp = 0x0102_0304_0506u64;
-        let stock = *b"ORCL    ";
-        let bytes = rpii_bytes(0x1111, 0x2222, timestamp, stock, b'B');
-
-        let parsed = parse_rpii(&bytes).expect("should parse");
-
-        assert_eq!(
-            parsed,
-            RPIIMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                interest_flag: b'B',
-            }
-        );
-    }
-
-    #[test]
-    fn parse_rpii_wrong_type_byte_returns_none() {
-        let mut bytes = rpii_bytes(1, 2, 0x0102_0304_0506, *b"ORCL    ", b'B');
-        bytes[0] = b'Z';
-        assert!(parse_rpii(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_rpii_truncated_returns_none() {
-        let mut bytes = rpii_bytes(1, 2, 0x0102_0304_0506, *b"ORCL    ", b'B');
-        bytes.pop();
-        assert!(parse_rpii(&bytes).is_none());
-    }
-
-    // ---- DLCRPriceDiscoveryMessage ----
-
-    #[allow(clippy::too_many_arguments)]
-    fn dlcr_price_discovery_bytes(
-        stock_locate: u16,
-        tracking_number: u16,
-        timestamp: u64,
-        stock: [u8; 8],
-        open_eligibility_status: u8,
-        minimum_allowable_price: u32,
-        maximum_allowable_price: u32,
-        near_execution_price: u32,
-        near_execution_time: u64,
-        lower_price_range_collar: u32,
-        upper_price_range_collar: u32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(DLCR_PRICE_DISCOVERY_MESSAGE_LEN);
-        buf.push(b'O');
-        buf.extend_from_slice(&stock_locate.to_be_bytes());
-        buf.extend_from_slice(&tracking_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf.extend_from_slice(&stock);
-        buf.push(open_eligibility_status);
-        buf.extend_from_slice(&minimum_allowable_price.to_be_bytes());
-        buf.extend_from_slice(&maximum_allowable_price.to_be_bytes());
-        buf.extend_from_slice(&near_execution_price.to_be_bytes());
-        buf.extend_from_slice(&near_execution_time.to_be_bytes());
-        buf.extend_from_slice(&lower_price_range_collar.to_be_bytes());
-        buf.extend_from_slice(&upper_price_range_collar.to_be_bytes());
-        assert_eq!(buf.len(), DLCR_PRICE_DISCOVERY_MESSAGE_LEN);
-        buf
-    }
-
-    #[test]
-    fn parse_dlcr_price_discovery_valid() {
-        // near_execution_time is the first 8-byte, non-u48 "timestamp-shaped"
-        // field in the project -- a distinct, recognizable value here would
-        // catch it accidentally being parsed with read_u48_be instead of a
-        // full 8-byte read.
-        let timestamp = 0x0102_0304_0506u64;
+    fn dlcr_uses_a_full_8_byte_near_execution_time() {
         let near_execution_time = 0x1122_3344_5566_7788u64;
-        let stock = *b"RIVN    ";
-        let bytes = dlcr_price_discovery_bytes(
-            0x1111,
-            0x2222,
-            timestamp,
-            stock,
-            b'Y',
-            90_000,
-            110_000,
-            100_000,
+        let bytes = build(b'O', DLCR_PRICE_DISCOVERY_MESSAGE_LEN, |buf| {
+            push_header(buf, 0x1111, 0x2222, TS);
+            buf.extend_from_slice(b"RIVN    ");
+            buf.push(b'Y');
+            buf.extend_from_slice(&90_000u32.to_be_bytes());
+            buf.extend_from_slice(&110_000u32.to_be_bytes());
+            buf.extend_from_slice(&100_000u32.to_be_bytes());
+            buf.extend_from_slice(&near_execution_time.to_be_bytes());
+            buf.extend_from_slice(&95_000u32.to_be_bytes());
+            buf.extend_from_slice(&105_000u32.to_be_bytes());
+        });
+        let expected = DLCRPriceDiscoveryMessage {
+            stock_locate: 0x1111,
+            tracking_number: 0x2222,
+            timestamp: TS,
+            stock: sym(b"RIVN    "),
+            open_eligibility_status: OpenEligibilityStatus::Eligible,
+            minimum_allowable_price: p4(90_000),
+            maximum_allowable_price: p4(110_000),
+            near_execution_price: p4(100_000),
             near_execution_time,
-            95_000,
-            105_000,
-        );
-
-        let parsed = parse_dlcr_price_discovery(&bytes).expect("should parse");
-
+            lower_price_range_collar: p4(95_000),
+            upper_price_range_collar: p4(105_000),
+        };
+        assert_eq!(parse_dlcr_price_discovery(&bytes), Ok(expected));
         assert_eq!(
-            parsed,
-            DLCRPriceDiscoveryMessage {
-                stock_locate: 0x1111,
-                tracking_number: 0x2222,
-                timestamp,
-                stock,
-                open_eligibility_status: b'Y',
-                minimum_allowable_price: 90_000,
-                maximum_allowable_price: 110_000,
-                near_execution_price: 100_000,
-                near_execution_time,
-                lower_price_range_collar: 95_000,
-                upper_price_range_collar: 105_000,
-            }
+            parse_message(&bytes),
+            Ok(ParsedMessage::DLCRPriceDiscovery(expected))
         );
-    }
-
-    #[test]
-    fn parse_dlcr_price_discovery_wrong_type_byte_returns_none() {
-        let mut bytes = dlcr_price_discovery_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"RIVN    ",
-            b'Y',
-            90_000,
-            110_000,
-            100_000,
-            0x1122_3344_5566_7788,
-            95_000,
-            105_000,
-        );
-        bytes[0] = b'Z';
-        assert!(parse_dlcr_price_discovery(&bytes).is_none());
-    }
-
-    #[test]
-    fn parse_dlcr_price_discovery_truncated_returns_none() {
-        let mut bytes = dlcr_price_discovery_bytes(
-            1,
-            2,
-            0x0102_0304_0506,
-            *b"RIVN    ",
-            b'Y',
-            90_000,
-            110_000,
-            100_000,
-            0x1122_3344_5566_7788,
-            95_000,
-            105_000,
-        );
-        bytes.pop();
-        assert!(parse_dlcr_price_discovery(&bytes).is_none());
+        assert_rejects(parse_dlcr_price_discovery, &bytes);
     }
 }
 // </Generated by Claude.ai>
